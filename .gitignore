@@ -1,0 +1,91 @@
+# ── Entorno virtual ───────────────────────────────────────────────
+trading_env/
+venv/
+.venv/
+env/
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+wheels/
+
+# ── Base de datos ─────────────────────────────────────────────────
+trading_system/data/trading_book.db
+trading_system/data/trading_book.db-shm
+trading_system/data/trading_book.db-wal
+*.db
+*.sqlite
+*.sqlite3
+*.db.backup_*
+
+# ── Caché de datos (yfinance / parquet / CSV) ─────────────────────
+trading_system/data/cache/
+*.parquet
+# Excepción: CSVs de exportación generados por Operations Log
+# (añadir manualmente a git si se quieren versionar)
+
+# ── Clon local del repo público de track record ──────────────────
+# public_logs/ es un repo git independiente (clon de GITHUB_REPO); no debe
+# versionarse dentro del repo principal.
+public_logs/
+
+# ── API keys y secretos ───────────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets.py
+config_local.py
+config_secrets.py
+
+# ── Backups automáticos ───────────────────────────────────────────
+trading_system/backups/*.db
+trading_system/backups/*.parquet
+
+# ── Logs y resultados temporales ─────────────────────────────────
+trading_system/logs/*.log
+!trading_system/logs/.gitkeep
+trading_system/exports/
+trading_system/data/exports/
+*.csv
+
+# ── Tests y cobertura ─────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+
+# ── IDEs ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Jupyter (por si acaso) ────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Plotly / visualizaciones temporales ──────────────────────────
+*.html
+!docs/*.html
+
+# ── Windows ───────────────────────────────────────────────────────
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ── Distribución / packaging ──────────────────────────────────────
+MANIFEST
+*.spec
