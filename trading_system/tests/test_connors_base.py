@@ -327,3 +327,49 @@ class TestConnorsBacktest:
         assert negativos.issubset({2022}), (
             f"Años negativos {negativos} — solo 2022 está permitido en negativo"
         )
+
+
+# ── TestMismaEmpresaGrupos ───────────────────────────────────────────────────
+
+class TestMismaEmpresaGrupos:
+    """Exclusión de doble clase de acciones de la misma empresa."""
+
+    def _excluidos(self, ocupados):
+        from modules.connors_rsi import _get_tickers_excluidos_por_grupo
+        return _get_tickers_excluidos_por_grupo(set(ocupados))
+
+    def test_goog_excluye_googl(self):
+        excluidos = self._excluidos({"GOOG"})
+        assert "GOOGL" in excluidos
+
+    def test_googl_excluye_goog(self):
+        excluidos = self._excluidos({"GOOGL"})
+        assert "GOOG" in excluidos
+
+    def test_fox_excluye_foxa(self):
+        excluidos = self._excluidos({"FOX"})
+        assert "FOXA" in excluidos
+
+    def test_foxa_excluye_fox(self):
+        excluidos = self._excluidos({"FOXA"})
+        assert "FOX" in excluidos
+
+    def test_ticker_fuera_de_grupo_no_excluye_nada(self):
+        excluidos = self._excluidos({"AAPL"})
+        assert not excluidos
+
+    def test_sin_ocupados_no_excluye_nada(self):
+        excluidos = self._excluidos(set())
+        assert not excluidos
+
+    def test_grupo_completo_ocupado_excluye_ambos(self):
+        # Si GOOGL y GOOG están ambas ocupadas, los dos aparecen en excluidos.
+        excluidos = self._excluidos({"GOOGL", "GOOG"})
+        assert {"GOOGL", "GOOG"}.issubset(excluidos)
+
+    def test_config_grupos_definidos(self):
+        grupos = config.MISMA_EMPRESA_GRUPOS
+        assert any({"GOOGL", "GOOG"} == g for g in grupos), \
+            "Grupo Alphabet no encontrado en MISMA_EMPRESA_GRUPOS"
+        assert any({"FOX", "FOXA"} == g for g in grupos), \
+            "Grupo Fox no encontrado en MISMA_EMPRESA_GRUPOS"

@@ -62,6 +62,14 @@ CONNORS_ENTRY_LIMIT   = 0.01     # 1 % bajo el cierre
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia
 CONNORS_MAX_POS       = 3        # posiciones simultáneas
 
+# Tickers de la misma empresa que no deben comprarse simultáneamente.
+# Si cualquier ticker de un grupo está ocupado (abierto o pendiente),
+# el resto del grupo queda excluido de los candidatos ese día.
+MISMA_EMPRESA_GRUPOS: list[set] = [
+    {"GOOGL", "GOOG"},   # Alphabet — correlación ~0.99
+    {"FOX",   "FOXA"},   # Fox Corporation — correlación ~0.98
+]
+
 # ── Backtesting ───────────────────────────────────────────────────────────────
 DEFAULT_START_DATE = "1999-01-01"
 DEFAULT_END_DATE = None   # None = hoy
