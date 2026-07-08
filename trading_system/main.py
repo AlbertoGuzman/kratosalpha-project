@@ -991,9 +991,35 @@ def _opcion_autopiloto() -> None:
     start_ts = datetime.now()
     _tlog = get_trading_logger()
     _slog = get_system_logger()
+
+    # Ancla la espera del cierre yfinance al día de lanzamiento: si la ejecución
+    # cruza la medianoche durante los reintentos, seguimos apuntando a la sesión
+    # del día en que arrancó el autopiloto (no al nuevo "hoy", sin cierre todavía).
+    from modules import yf_cache
+    yf_cache.set_close_wait_ref(start_ts.date())
+
     console.rule(
         f"[bold]AUTOPILOTO  ·  {start_ts:%d/%m/%Y %H:%M:%S}[/bold]"
     )
+
+    # ── Aviso si el mercado está cerrado (modo manual: no bloquea) ──────────
+    # En headless el gate está en _run_headless y nunca se llega aquí en festivo.
+    # Desde el menú el usuario opera igualmente con los datos del último cierre;
+    # `es_festivo` se propaga a aperturas_automaticas para omitir su guarda interna.
+    es_festivo = not es_dia_habil_nyse(start_ts.date())
+    if es_festivo:
+        console.print(
+            Panel(
+                f"[yellow]Hoy ({start_ts.date()}) no es día hábil NYSE.[/yellow]\n"
+                "Modo manual: se operará con los datos del último cierre disponible.",
+                title="[bold yellow]Mercado cerrado — usando último cierre[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+        _slog.info(
+            "autopiloto manual: %s no es día hábil NYSE — operando con último cierre disponible",
+            start_ts.date(),
+        )
 
     alpaca_on = bool(getattr(config, "ALPACA_ENABLED", False))
     alpaca_label = (
@@ -1107,7 +1133,11 @@ def _opcion_autopiloto() -> None:
             # `aperturas_automaticas` llama internamente a `_download_universe()`
             # sin tickers → descarga el universo completo. El cache de sesión
             # evita re-descargar los tickers de cartera ya cargados arriba.
-            cr.aperturas_automaticas(reconciliar_primero=False, confirmar=False)
+            cr.aperturas_automaticas(
+                reconciliar_primero=False,
+                confirmar=False,
+                ignorar_festivo=es_festivo,
+            )
             n_pend_final = cr._count_pending_orders()
             n_open_final = len(cr._get_open_positions())
             stats["connors_aperturas"] = (
@@ -1236,8 +1266,8 @@ def _autopiloto_informe(
     _tlog.info("Capital ConnorsRSI : %.0f€ (%+.1f%%)", cap_connors_act, cap_connors_pct)
     _tlog.info("── FIN AUTOPILOTO %s", "─" * 40)
 
-    # ── Notificación Telegram (solo en PRO) ──────────────────────────────────
-    if config.TRADING_ENV in ("dev", "pre", "pro"):
+    # ── Notificación Telegram (pre y pro; dev no notifica; festivos tampoco) ──
+    if config.TRADING_ENV in ("pre", "pro") and es_dia_habil_nyse(start_ts.date()):
         try:
             from modules.notifier import send_telegram, build_daily_summary
             from modules.alpaca_broker import get_pnl_real
@@ -1281,6 +1311,23 @@ def _run_headless(mode: str) -> int:
     _slog = get_system_logger()
     _tlog = get_trading_logger()
     _slog.info("Modo headless --run %s --env %s", mode, config.TRADING_ENV)
+
+    # Ancla la espera del cierre yfinance al día de lanzamiento (captura la fecha
+    # antes de cualquier descarga) para que el cruce de medianoche no desplace la
+    # sesión objetivo al día siguiente.
+    fecha_ref = date.today()
+    from modules import yf_cache
+    yf_cache.set_close_wait_ref(fecha_ref)
+
+    # ── Gate de calendario NYSE ──────────────────────────────────────────────
+    # En modo desatendido no operamos si el mercado está cerrado: no hay backup,
+    # no hay reconciliación, no hay órdenes y no se envía nada a Telegram.
+    if not es_dia_habil_nyse(fecha_ref):
+        _slog.info(
+            "Modo headless --run %s: %s no es día hábil NYSE — ejecución omitida",
+            mode, fecha_ref,
+        )
+        return 0
 
     try:
         if mode == "all":
@@ -1366,6 +1413,12 @@ def main() -> None:
     _slog = get_system_logger()
     get_trading_logger()
     _slog.info("Arrancando --env %s", config.TRADING_ENV)
+
+    # Modo interactivo: hay un humano al teclado, así que no bloqueamos hasta 4 h
+    # esperando el cierre de la sesión en yfinance. Se opera con los últimos datos
+    # disponibles. El modo headless (--run) NO activa esto y mantiene la espera.
+    from modules import yf_cache
+    yf_cache.set_skip_close_wait(True)
 
     console.clear()
     console.print()

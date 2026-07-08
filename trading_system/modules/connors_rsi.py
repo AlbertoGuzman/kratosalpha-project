@@ -795,9 +795,30 @@ def _post_apertura_actualizar_capital(cash_final: float, n_abiertas: int) -> Non
     )
 
 
+def _get_tickers_excluidos_por_grupo(ocupados: set) -> set:
+    """
+    Para cada ticker en 'ocupados', si pertenece a un grupo de misma empresa
+    (config.MISMA_EMPRESA_GRUPOS), añade todos los tickers del grupo a los
+    excluidos. Evita comprar dos clases de acciones de la misma empresa
+    (p.ej. GOOGL+GOOG, FOX+FOXA) cuando alguna ya está en cartera o pendiente.
+
+    Params:
+        ocupados: conjunto de tickers con posición abierta o pendiente.
+    Returns:
+        Conjunto de tickers a excluir por pertenecer al mismo grupo que un
+        ticker ocupado. Puede incluir tickers que ya estaban en 'ocupados'.
+    """
+    excluidos: set = set()
+    for grupo in config.MISMA_EMPRESA_GRUPOS:
+        if grupo & ocupados:
+            excluidos |= grupo
+    return excluidos
+
+
 def aperturas_automaticas(
     reconciliar_primero: bool = False,
     confirmar: bool = True,
+    ignorar_festivo: bool = False,
 ) -> int:
     """
     Apertura ConnorsRSI no-interactiva en modo A.
@@ -820,13 +841,16 @@ def aperturas_automaticas(
             antes de enviar las órdenes. Si False, envía sin preguntar
             (ejecución totalmente desatendida — útil en tests y en flujos
             programáticos que ya han confirmado aguas arriba).
+        ignorar_festivo: si True, omite la guarda de día hábil NYSE. Útil
+            en modo manual para operar con los datos del último cierre aunque
+            hoy sea festivo o fin de semana.
 
     Returns:
         Nº de órdenes enviadas correctamente. 0 si no hay slots, no hay
         señales aprovechables, falta capital o el usuario canceló la
         confirmación.
     """
-    if not es_dia_habil_nyse():
+    if not ignorar_festivo and not es_dia_habil_nyse():
         _slog.info("Festivo NYSE -- sin operativa ConnorsRSI hoy")
         console.print("[dim]Festivo NYSE — sin operativa ConnorsRSI hoy.[/dim]")
         return 0
@@ -869,7 +893,8 @@ def aperturas_automaticas(
     # Tickers en venta pendiente se excluyen de 'ocupados' (slot liberado)
     # pero no se vuelven candidatos de re-entrada en el mismo ciclo.
     ocupados  = (set(positions) - pending_sells) | set(pendings)
-    available = [s for s in signals if s["ticker"] not in ocupados]
+    excluidos = _get_tickers_excluidos_por_grupo(ocupados)
+    available = [s for s in signals if s["ticker"] not in ocupados | excluidos]
     if not available:
         console.print("[yellow]Todas las señales activas ya están en cartera.[/yellow]")
         return 0
@@ -953,7 +978,8 @@ def opcion_registrar_entrada() -> None:
 
     # Tickers en venta pendiente liberan slot pero no son re-candidatos
     ocupados  = (set(positions) - pending_sells) | set(pendings)
-    available = [s for s in signals if s["ticker"] not in ocupados]
+    excluidos = _get_tickers_excluidos_por_grupo(ocupados)
+    available = [s for s in signals if s["ticker"] not in ocupados | excluidos]
     if not available:
         console.print("[yellow]Todas las señales activas ya están en cartera.[/yellow]")
         return

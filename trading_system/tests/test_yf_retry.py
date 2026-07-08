@@ -35,6 +35,18 @@ def _spy_df(last_date: date) -> pd.DataFrame:
     return pd.DataFrame({"Close": [100.0]}, index=idx)
 
 
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_close_wait_state():
+    """Restaura `_CLOSE_WAIT_REF` (None) y `_SKIP_CLOSE_WAIT` (False) entre tests."""
+    yfc.set_close_wait_ref(None)
+    yfc.set_skip_close_wait(False)
+    yield
+    yfc.set_close_wait_ref(None)
+    yfc.set_skip_close_wait(False)
+
+
 # ── 1) DEV → no reintenta ────────────────────────────────────────────────────
 
 def test_dev_no_reintenta(monkeypatch):
@@ -161,3 +173,90 @@ def test_cambio_de_dia_sigue_dia_lanzamiento(monkeypatch):
     # Aceptó la sesión del día de lanzamiento (D) tras el cambio de día.
     assert result is True
     assert mock_sleep.call_count == 1
+
+
+# ── 7) _CLOSE_WAIT_REF ancla a la fecha de lanzamiento ───────────────────────
+
+def test_close_wait_ref_ancla_a_fecha_lanzamiento(monkeypatch):
+    """
+    Run lanzado el lunes pero con el reloj ya en martes (la espera cruzó la
+    medianoche). Si `_CLOSE_WAIT_REF` se ancló al lunes y SPY tiene el cierre del
+    lunes, `wait_for_last_close` devuelve True sin reintentar: usa la fecha de
+    referencia, no date.today() (que ya marca martes, sin cierre todavía).
+    """
+    monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+
+    lunes  = date(2026, 6, 8)
+    martes = date(2026, 6, 9)
+
+    class _FakeDate(date):
+        @classmethod
+        def today(cls):
+            return martes
+
+    monkeypatch.setattr(yfc, "date", _FakeDate)
+    monkeypatch.setattr(yfc, "session_data", {"SPY": _spy_df(lunes)})
+    yfc.set_close_wait_ref(lunes)
+
+    with patch("modules.yf_cache.es_dia_habil_nyse", return_value=True), \
+         patch("time.sleep") as mock_sleep:
+        result = yfc.wait_for_last_close()
+
+    # Objetivo anclado al lunes (la referencia), cubierto por SPY → sin espera.
+    assert result is True
+    mock_sleep.assert_not_called()
+
+
+def test_sin_ref_usa_today_y_reintenta(monkeypatch):
+    """
+    Contraste del test anterior: sin `_CLOSE_WAIT_REF` (None), el objetivo se ancla
+    a date.today()=martes. Con SPY solo hasta el lunes, el objetivo (martes) no se
+    cubre y agota los reintentos → False. Demuestra que el ancla es lo que cambia
+    el comportamiento.
+    """
+    monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+    monkeypatch.setattr(config, "YF_RETRY_ATTEMPTS", 2)
+    monkeypatch.setattr(config, "YF_RETRY_WAIT_MIN", 1)
+
+    lunes  = date(2026, 6, 8)
+    martes = date(2026, 6, 9)
+
+    class _FakeDate(date):
+        @classmethod
+        def today(cls):
+            return martes
+
+    monkeypatch.setattr(yfc, "date", _FakeDate)
+    monkeypatch.setattr(yfc, "session_data", {"SPY": _spy_df(lunes)})
+    # Sin set_close_wait_ref → _CLOSE_WAIT_REF es None (la fixture autouse lo asegura).
+
+    with patch("modules.yf_cache.es_dia_habil_nyse", return_value=True), \
+         patch("modules.yf_cache.disk_cache_file",
+               return_value=MagicMock(exists=lambda: False)), \
+         patch("modules.yf_cache.load_ticker", return_value=_spy_df(lunes)), \
+         patch("time.sleep") as mock_sleep:
+        result = yfc.wait_for_last_close()
+
+    assert result is False
+    assert mock_sleep.call_count == 2
+
+
+# ── 8) _SKIP_CLOSE_WAIT (modo interactivo) → no espera ───────────────────────
+
+def test_skip_close_wait_no_espera(monkeypatch):
+    """
+    Con `_SKIP_CLOSE_WAIT` activo (modo interactivo), `wait_for_last_close`
+    devuelve True de inmediato aunque ALPACA esté activo y SPY tenga datos viejos:
+    se opera con lo disponible sin sondear.
+    """
+    monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+    # SPY muy desactualizado: sin el skip, esto dispararía reintentos.
+    monkeypatch.setattr(yfc, "session_data", {"SPY": _spy_df(date.today() - timedelta(10))})
+    yfc.set_skip_close_wait(True)
+
+    with patch("modules.yf_cache.es_dia_habil_nyse", return_value=True), \
+         patch("time.sleep") as mock_sleep:
+        result = yfc.wait_for_last_close()
+
+    assert result is True
+    mock_sleep.assert_not_called()

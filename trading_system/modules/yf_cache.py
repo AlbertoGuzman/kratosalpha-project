@@ -57,6 +57,50 @@ except ImportError:
 # Caché de sesión compartida entre estrategias: {ticker: DataFrame}
 session_data: dict = {}
 
+# Fecha de referencia para anclar la espera del cierre yfinance al día de
+# lanzamiento del run (no a date.today()). El autopiloto/headless la fija al
+# arrancar; si la ejecución cruza la medianoche durante los reintentos de
+# yfinance, `wait_for_last_close` sigue apuntando a la sesión de ese día y no a
+# la del nuevo "hoy" (que aún no ha cerrado). None → comportamiento por defecto
+# (date.today()), que es lo que usa el modo interactivo.
+_CLOSE_WAIT_REF = None
+
+
+def set_close_wait_ref(fecha) -> None:
+    """
+    Fija (o limpia) la fecha de referencia para `wait_for_last_close`.
+
+    Params:
+        fecha: `datetime.date` con el día de lanzamiento del run, o None para
+            restaurar el comportamiento por defecto (anclar a date.today()).
+    Returns:
+        None
+    """
+    global _CLOSE_WAIT_REF
+    _CLOSE_WAIT_REF = fecha
+
+
+# Si está activo, `wait_for_last_close` devuelve True de inmediato sin sondear:
+# se opera con los últimos datos disponibles. Lo activa el modo interactivo
+# (menú `main()`), donde hay un humano que no debe quedar bloqueado hasta 4 h
+# esperando el cierre del día. El modo headless (--run, Task Scheduler) lo deja
+# en False para que el cron sí espere a que yfinance publique la sesión.
+_SKIP_CLOSE_WAIT = False
+
+
+def set_skip_close_wait(skip: bool) -> None:
+    """
+    Activa/desactiva el salto de la espera del cierre en `wait_for_last_close`.
+
+    Params:
+        skip: True para no esperar (operar con los últimos datos disponibles);
+            False (por defecto) para mantener el sondeo de reintentos.
+    Returns:
+        None
+    """
+    global _SKIP_CLOSE_WAIT
+    _SKIP_CLOSE_WAIT = skip
+
 
 # ── API de sesión ─────────────────────────────────────────────────────────────
 
@@ -240,8 +284,16 @@ def wait_for_last_close() -> bool:
       · Sondea cada `YF_RETRY_WAIT_MIN` minutos (30 por defecto) hasta
         `YF_RETRY_ATTEMPTS` veces, re-descargando SPY (invalida caché en disco).
 
+    El ancla de la fecha de lanzamiento se toma de `_CLOSE_WAIT_REF` si está
+    fijada (vía `set_close_wait_ref`, lo hacen el autopiloto y el modo headless);
+    si es None se usa `date.today()`. Esto evita que, cuando el autopiloto se
+    lanza de noche y la espera cruza la medianoche, `fecha_inicio` capture ya el
+    día siguiente y pasemos a exigir una sesión que aún no ha cerrado.
+
     Solo reintenta si ALPACA_ENABLED=True (descarta DEV y backtests); en DEV
-    devuelve True sin esperar para no bloquear el flujo.
+    devuelve True sin esperar para no bloquear el flujo. Si `_SKIP_CLOSE_WAIT`
+    está activo (lo enciende el modo interactivo vía `set_skip_close_wait`),
+    devuelve True de inmediato y se opera con los últimos datos disponibles.
 
     Returns:
         True si SPY ya cubre la sesión objetivo (o no procede reintentar);
@@ -249,11 +301,16 @@ def wait_for_last_close() -> bool:
     """
     import config
 
+    # Modo interactivo: no bloquear esperando el cierre, operar con lo disponible.
+    if _SKIP_CLOSE_WAIT:
+        _slog.info("wait_for_last_close: espera omitida (_SKIP_CLOSE_WAIT)")
+        return True
+
     # No reintentar en DEV/backtest (ALPACA_ENABLED=False)
     if not getattr(config, "ALPACA_ENABLED", False):
         return True
 
-    fecha_inicio = date.today()
+    fecha_inicio = _CLOSE_WAIT_REF or date.today()
 
     def _objetivo() -> date:
         """Sesión NYSE cuyo cierre esperamos, anclada a la fecha de lanzamiento.
