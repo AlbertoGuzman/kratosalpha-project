@@ -186,6 +186,11 @@ class TestAutopilotoManualFestivo:
         monkeypatch.setattr(main.cr, "_check_pending_orders", lambda: {})
         monkeypatch.setattr(main, "_autopiloto_cerrar_connors_automatico", lambda: None)
         monkeypatch.setattr(main, "_autopiloto_informe", lambda *a, **kw: None)
+        # Sin estos mocks, el test depende del estado del dev DB: si hay
+        # CONNORS_MAX_POS posiciones abiertas, slots_libres=0 y aperturas
+        # nunca se llama. Siempre debe haber al menos 1 slot libre.
+        monkeypatch.setattr(main.cr, "_get_open_positions", lambda: [])
+        monkeypatch.setattr(main.cr, "_count_pending_orders", lambda: 0)
 
         kwargs_capturados: list[dict] = []
         monkeypatch.setattr(

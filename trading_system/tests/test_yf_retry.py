@@ -95,6 +95,7 @@ def test_ultima_sesion_salta_no_habiles(monkeypatch):
 
 def test_reintento_exitoso(monkeypatch):
     monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+    monkeypatch.setattr(config, "LOOKAHEAD_FIX", False)
     monkeypatch.setattr(config, "YF_RETRY_ATTEMPTS", 8)
     monkeypatch.setattr(config, "YF_RETRY_WAIT_MIN", 1)
     # SPY en sesión tiene datos de ayer; objetivo = hoy.
@@ -117,6 +118,7 @@ def test_reintento_exitoso(monkeypatch):
 
 def test_reintentos_agotados(monkeypatch):
     monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+    monkeypatch.setattr(config, "LOOKAHEAD_FIX", False)
     monkeypatch.setattr(config, "YF_RETRY_ATTEMPTS", 3)
     monkeypatch.setattr(config, "YF_RETRY_WAIT_MIN", 1)
     ayer = date.today() - timedelta(days=1)
@@ -143,6 +145,7 @@ def test_cambio_de_dia_sigue_dia_lanzamiento(monkeypatch):
     datos de D — NO exigir la sesión del nuevo hoy (D+1, que aún no ha cerrado).
     """
     monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+    monkeypatch.setattr(config, "LOOKAHEAD_FIX", False)
     monkeypatch.setattr(config, "YF_RETRY_ATTEMPTS", 4)
     monkeypatch.setattr(config, "YF_RETRY_WAIT_MIN", 1)
 
@@ -215,6 +218,7 @@ def test_sin_ref_usa_today_y_reintenta(monkeypatch):
     el comportamiento.
     """
     monkeypatch.setattr(config, "ALPACA_ENABLED", True)
+    monkeypatch.setattr(config, "LOOKAHEAD_FIX", False)
     monkeypatch.setattr(config, "YF_RETRY_ATTEMPTS", 2)
     monkeypatch.setattr(config, "YF_RETRY_WAIT_MIN", 1)
 

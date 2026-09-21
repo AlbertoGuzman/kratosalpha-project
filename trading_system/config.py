@@ -58,7 +58,7 @@ CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
 CONNORS_STOP_LOSS     = 0.05     # 5 %
 CONNORS_TIME_STOP     = 5        # días máximos abierta
 CONNORS_MIN_STREAK    = 3        # nº mínimo de días consecutivos bajando para entrar
-CONNORS_ENTRY_LIMIT   = 0.01     # 1 % bajo el cierre
+CONNORS_ENTRY_LIMIT   = 0.01     # descuento sobre Close[D-1] para la orden limit
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia
 CONNORS_MAX_POS       = 3        # posiciones simultáneas
 
@@ -73,6 +73,24 @@ MISMA_EMPRESA_GRUPOS: list[set] = [
 # ── Backtesting ───────────────────────────────────────────────────────────────
 DEFAULT_START_DATE = "1999-01-01"
 DEFAULT_END_DATE = None   # None = hoy
+
+# Cuando True, las señales de entrada en el backtest usan datos hasta Close[D-1]
+# y la posición se abre en D — elimina el look-ahead bias del precio de señal.
+# False = comportamiento original (con look-ahead) para poder comparar ambos modos.
+LOOKAHEAD_FIX = True
+
+# Cuando True, el precio de fill en el backtest es Close[D] (cierre del día de
+# entrada), no el límite Close[D-1]×(1-ENTRY_LIMIT). Simula una orden MOC y
+# elimina el sesgo de asumir 100% fill con descuento. Requiere LOOKAHEAD_FIX=True
+# para que la combinación sea realista (señal D-1, fill al cierre de D).
+FILL_AT_CLOSE = False
+
+# Cuando True, los cierres de posición en Alpaca se envían como órdenes MOC
+# (Market on Close, TimeInForce.CLS) en lugar de órdenes de mercado inmediatas.
+# El fill ocurre al cierre de NYSE ese día, igual que en el backtest (Close[D]).
+# Usar junto con LOOKAHEAD_FIX=True: autopiloto a las 15:30 → señales D-1,
+# entradas limit y salidas MOC → operativa coherente con el backtest.
+EXIT_MOC = True
 
 # ── Períodos históricos para backtesting de estrés ────────────────────────────
 # Cada período empieza ANTES de que estalle la crisis para evaluar cómo se

@@ -21,12 +21,15 @@ if __name__ == "__main__":
         help="Entorno de ejecución (selecciona la BD bajo data/<env>/).",
     )
     _parser.add_argument(
-        "--run", choices=["all", "connors"], default=None,
-        metavar="{all,connors}",
+        "--run", choices=["all", "connors", "exits"], default=None,
+        metavar="{all,connors,exits}",
         help=(
             "Modo desatendido (sin menú): "
-            "'all' = autopiloto completo, "
-            "'connors' = solo ConnorsRSI."
+            "'all' = autopiloto completo (entradas + salidas con datos D-1), "
+            "'connors' = solo ConnorsRSI, "
+            "'exits' = solo salidas con datos intradía del día actual "
+            "(lanzar ~21:30 local / 15:30 ET para que CRSI ≈ Close[D] y "
+            "el exit timing coincida con el backtest)."
         ),
     )
     _parsed_args = _parser.parse_args()
@@ -937,27 +940,56 @@ def _connors_pnl_realizado_hoy() -> tuple[int, float]:
     return (int(row[0] or 0), float(row[1] or 0.0))
 
 
-def _autopiloto_cerrar_connors_automatico() -> int:
+def _autopiloto_cerrar_connors_automatico(
+    usar_precio_alpaca: bool = False,
+) -> int:
     """
     Cierra automáticamente posiciones ConnorsRSI que cumplen SL / TSTO /
     CRSI_EXIT. Devuelve el número de cierres ejecutados.
 
-    A diferencia de `opcion_registrar_salida` (interactiva, una a una), aquí
-    procesamos todas en bloque sin preguntar. Es el comportamiento que define
-    el spec del autopiloto.
+    Params:
+        usar_precio_alpaca: cuando True (modo --run exits a las 15:30 ET),
+            obtiene el precio en tiempo real de Alpaca para cada posición y lo
+            usa para calcular CRSI[D], replicando el comportamiento del backtest
+            (CRSI[D] > 60 → MOC → Close[D]) sin depender de yfinance intradía.
     """
     positions = cr._get_open_positions()
     if not positions:
         return 0
 
-    # _scan_exit_signals necesita yf_cache.session_data poblado. Lo carga la
-    # propia función si está vacío, descargando el universo. Para evitar pagar
-    # dos veces la descarga en el mismo turno, sólo descargamos si está vacío.
+    # _scan_exit_signals necesita yf_cache.session_data poblado.
     from modules import yf_cache
     if not yf_cache.session_data:
-        cr._download_universe()
+        if usar_precio_alpaca:
+            # Modo exits: solo descargamos los tickers en cartera (2-3 máx.)
+            # para no consumir los 20 min antes del deadline MOC (15:50 ET)
+            # descargando los 349 del universo completo.
+            cr._download_universe(tickers=list(positions.keys()))
+        else:
+            cr._download_universe()
 
-    exits = cr._scan_exit_signals(positions)
+    # Precios en tiempo real de Alpaca (solo en modo exits)
+    precios_alpaca: dict | None = None
+    if usar_precio_alpaca and getattr(config, "ALPACA_ENABLED", False):
+        try:
+            from modules.alpaca_broker import get_broker
+            alpaca_pos = get_broker().get_positions()
+            precios_alpaca = {
+                p["symbol"]: float(p["current_price"])
+                for p in alpaca_pos
+                if p.get("current_price")
+            }
+            console.print(
+                f"  [cyan]Precios Alpaca obtenidos para "
+                f"{len(precios_alpaca)} ticker(s)[/cyan]"
+            )
+        except Exception as exc:
+            console.print(
+                f"[yellow]⚠ No se pudieron obtener precios Alpaca: {exc} "
+                f"— usando último cierre disponible[/yellow]"
+            )
+
+    exits = cr._scan_exit_signals(positions, precios_alpaca=precios_alpaca)
     n_cerradas = 0
     for e in exits:
         if not e["reason"]:
@@ -1304,7 +1336,10 @@ def _run_headless(mode: str) -> int:
     Ejecuta el sistema sin menú interactivo. Diseñado para cron / CI.
 
     Params:
-        mode: "all" | "connors"
+        mode: "all" | "connors" | "exits"
+            "exits" → solo comprueba salidas usando precio intradía del día actual
+            (lanzar ~21:30 local / 15:30 ET para que CRSI ≈ Close[D] y el timing
+            de salida coincida con el backtest: CRSI[D] > 60 → MOC → Close[D]).
     Returns:
         0 si todo fue bien, 1 si hubo algún error.
     """
@@ -1349,6 +1384,20 @@ def _run_headless(mode: str) -> int:
             )
             if slots > 0:
                 cr.aperturas_automaticas(reconciliar_primero=False, confirmar=False)
+
+        elif mode == "exits":
+            # Modo salidas con precio real: lanzar ~21:30 local (15:30 ET),
+            # 20 min antes del deadline MOC (15:50 ET).
+            # Obtiene current_price de Alpaca → calcula CRSI[D] real →
+            # si CRSI[D] > 60, envía MOC → fill al Close[D].
+            # Esto replica exactamente el comportamiento del backtest sin
+            # depender de yfinance intradía (que es inconsistente).
+            yf_cache.set_skip_close_wait(True)
+            n = _autopiloto_cerrar_connors_automatico(usar_precio_alpaca=True)
+            _tlog.info(
+                "headless --run exits: %d salida(s) con precio Alpaca tiempo real",
+                n,
+            )
 
         _tlog.info("headless --run %s completado OK", mode)
         return 0

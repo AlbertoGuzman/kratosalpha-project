@@ -306,6 +306,12 @@ def wait_for_last_close() -> bool:
         _slog.info("wait_for_last_close: espera omitida (_SKIP_CLOSE_WAIT)")
         return True
 
+    # Con LOOKAHEAD_FIX las señales usan el cierre de D-1, ya publicado cuando
+    # el autopiloto arranca a apertura NYSE. No hay que esperar el cierre de hoy.
+    if getattr(config, "LOOKAHEAD_FIX", False):
+        _slog.info("wait_for_last_close: omitida (LOOKAHEAD_FIX — señales usan D-1)")
+        return True
+
     # No reintentar en DEV/backtest (ALPACA_ENABLED=False)
     if not getattr(config, "ALPACA_ENABLED", False):
         return True
@@ -431,4 +437,10 @@ def yf_download_one(ticker: str, start: str, end: str) -> pd.DataFrame | None:
             f"  [yellow]⚠ {ticker}: columnas inesperadas {df.columns.tolist()}[/yellow]"
         )
         return None
-    return df[needed].dropna()
+    df = df[needed].dropna()
+    # yfinance con auto_adjust=True puede incluir filas con fechas futuras
+    # (eventos corporativos pre-anunciados: splits, dividendos especiales).
+    # Las filtramos para evitar que el índice de caché quede contaminado.
+    today_ts = pd.Timestamp(date.today())
+    df = df[df.index <= today_ts]
+    return df if not df.empty else None

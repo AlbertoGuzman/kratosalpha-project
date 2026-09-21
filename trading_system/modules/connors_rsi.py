@@ -511,6 +511,14 @@ def _scan_entry_signals(
 
     if target is None:
         target = max(df.index[-1] for df in raw.values() if not df.empty)
+        # Con LOOKAHEAD_FIX la señal debe ser D-1, nunca el día actual.
+        # yfinance puede devolver datos parciales del día en curso (mercado abierto)
+        # que inflan el CRSI artificialmente. Los excluimos.
+        if getattr(config, "LOOKAHEAD_FIX", False):
+            today_ts = pd.Timestamp(date.today())
+            if target >= today_ts:
+                prev = target - pd.tseries.offsets.BDay(1)
+                target = prev
 
     if target not in spy_with.index:
         return []
@@ -1033,16 +1041,56 @@ def opcion_registrar_entrada() -> None:
 
 # ── Opción D — Registrar salida ──────────────────────────────────────────────
 
-def _scan_exit_signals(positions: dict) -> list:
-    """Para cada posición abierta, decide si toca salida y por qué motivo."""
+def _append_today_price(df: pd.DataFrame, precio: float) -> pd.DataFrame:
+    """
+    Añade (o reemplaza) la fila del día actual con `precio` como Close.
+    Permite calcular CRSI[D] usando el precio real de Alpaca en lugar de
+    depender de yfinance intradía (que puede ser inconsistente o cacheado).
+    Solo Close importa para el cálculo de CRSI; el resto de columnas se rellena.
+
+    Params:
+        df:     DataFrame OHLCV con índice DatetimeIndex (datos hasta D-1).
+        precio: precio actual (Alpaca current_price).
+    Returns:
+        DataFrame con una fila adicional para hoy.
+    """
+    today_ts = pd.Timestamp(date.today())
+    if today_ts in df.index:
+        df = df.drop(index=today_ts)
+    cols = {c: precio for c in ("Open", "High", "Low", "Close") if c in df.columns}
+    if "Volume" in df.columns:
+        cols["Volume"] = 0
+    fila = pd.DataFrame(cols, index=[today_ts])
+    return pd.concat([df, fila]).sort_index()
+
+
+def _scan_exit_signals(
+    positions: dict,
+    precios_alpaca: dict | None = None,
+) -> list:
+    """
+    Para cada posición abierta, decide si toca salida y por qué motivo.
+
+    Params:
+        positions:     posiciones abiertas del sistema.
+        precios_alpaca: {ticker: precio_actual} obtenidos de Alpaca en tiempo
+            real. Cuando se proporcionan (modo --run exits a las 15:30 ET),
+            se usan para calcular CRSI[D] con el precio del día en curso,
+            replicando exactamente el comportamiento del backtest
+            (CRSI[D] > 60 → MOC → Close[D]).
+    """
     out: list = []
     today_d = date.today()
     for ticker, pos in positions.items():
-        cur_p   = _last_close(ticker)
+        # Precio actual: Alpaca (tiempo real) si disponible, si no último cierre
+        cur_p = (
+            precios_alpaca.get(ticker)
+            if precios_alpaca and ticker in precios_alpaca
+            else _last_close(ticker)
+        )
         if cur_p is None:
             continue
-        entry_p = pos["entry_price"]
-        sl_p    = pos["stop_loss_price"]
+        sl_p = pos["stop_loss_price"]
         try:
             entry_d = datetime.fromisoformat(pos["entry_date"]).date()
             dias    = (today_d - entry_d).days
@@ -1058,6 +1106,10 @@ def _scan_exit_signals(positions: dict) -> list:
             df = yf_cache.get_session(ticker)
             if df is not None and not df.empty:
                 try:
+                    # Con precio Alpaca: añadimos la fila de hoy para obtener
+                    # CRSI[D] real en lugar de CRSI[D-1] del cierre anterior.
+                    if precios_alpaca and ticker in precios_alpaca:
+                        df = _append_today_price(df, cur_p)
                     ind = compute_connors(df)
                     crsi_now = float(ind["CONNORS_RSI"].dropna().iloc[-1])
                     if crsi_now > config.CONNORS_EXIT_CRSI:
@@ -1206,8 +1258,24 @@ def _close_position_db(
         try:
             from modules.alpaca_broker import get_broker
             broker = get_broker()
-            broker.close_position(ticker)
-            console.print(f"[cyan]📤 Posición cerrada en Alpaca: {ticker}[/cyan]")
+            # SL siempre market inmediato; CRSI_EXIT/TSTO/MANUAL pueden ser MOC.
+            use_moc = getattr(config, "EXIT_MOC", False) and reason != "SL"
+            if use_moc:
+                # MOC: fill al cierre NYSE del día, igual que el backtest (Close[D]).
+                # Requiere enviar la orden antes de las 15:50 ET (3:50 PM).
+                # Alpaca no admite fracciones en MOC → truncar a entero.
+                moc_qty = int(shares)
+                if moc_qty <= 0:
+                    broker.close_position(ticker)
+                else:
+                    broker.submit_order(ticker, moc_qty, "sell", moc=True)
+                console.print(
+                    f"[cyan]📤 Orden MOC enviada para {ticker} "
+                    f"({shares:.4f} acc.) — fill al cierre[/cyan]"
+                )
+            else:
+                broker.close_position(ticker)
+                console.print(f"[cyan]📤 Posición cerrada en Alpaca: {ticker}[/cyan]")
         except Exception as exc:
             console.print(f"[yellow]⚠ Alpaca: {exc}[/yellow]")
             _slog.error("close_position Alpaca %s: %s", ticker, exc, exc_info=True)
@@ -1316,7 +1384,7 @@ def run_connors_backtest(
     n_exits_crsi    = 0
     rejected = {"sma": 0, "crsi": 0, "low3": 0}
 
-    for d in all_dates:
+    for i_d, d in enumerate(all_dates):
         # ── Salidas ──────────────────────────────────────────────────────────
         for ticker in list(positions.keys()):
             pos = positions[ticker]
@@ -1372,9 +1440,22 @@ def run_connors_backtest(
             })
             del positions[ticker]
 
+        # ── Fecha de señal (D-1 con LOOKAHEAD_FIX, D sin él) ────────────────
+        # Con LOOKAHEAD_FIX las condiciones de entrada se evalúan con datos
+        # del cierre de D-1 (la señal se confirma con el cierre anterior) y la
+        # posición se registra con entry_date = D (se entra al día siguiente).
+        if config.LOOKAHEAD_FIX:
+            if i_d == 0:
+                continue   # primer día: sin día previo, no hay señal posible
+            d_sig = all_dates[i_d - 1]
+        else:
+            d_sig = d
+
         # ── Filtro de mercado ────────────────────────────────────────────────
-        spy_close = float(spy.loc[d, "Close"])
-        spy_sma   = spy.loc[d, "SMA200"]
+        if d_sig not in spy.index:
+            continue
+        spy_close = float(spy.loc[d_sig, "Close"])
+        spy_sma   = spy.loc[d_sig, "SMA200"]
         market_ok = (not pd.isna(spy_sma)) and (spy_close >= float(spy_sma))
         if not market_ok:
             n_market_off += 1
@@ -1387,9 +1468,9 @@ def run_connors_backtest(
         for ticker, ind in indicators.items():
             if ticker in positions:
                 continue
-            if d not in ind.index:
+            if d_sig not in ind.index:
                 continue
-            row    = ind.loc[d]
+            row    = ind.loc[d_sig]
             close  = float(row["Close"])
             sma200 = row["SMA200"]
             crsi   = row["CONNORS_RSI"]
@@ -1401,15 +1482,24 @@ def run_connors_backtest(
             if float(crsi) >= config.CONNORS_ENTRY_CRSI:
                 rejected["crsi"] += 1
                 continue
-            if not _has_3_day_low(ind, d):
+            if not _has_3_day_low(ind, d_sig):
                 rejected["low3"] += 1
                 continue
+            # Precio de fill: cierre del día de entrada D si FILL_AT_CLOSE,
+            # si no el cierre del día de señal (que el limit usa como referencia).
+            if config.FILL_AT_CLOSE and d_sig != d:
+                if d not in ind.index:
+                    continue   # sin cierre en D → no podemos simular MOC
+                close_entry = float(ind.loc[d, "Close"])
+            else:
+                close_entry = close
             candidates.append({
-                "ticker": ticker,
-                "close":  close,
-                "crsi":   float(crsi),
-                "rsi3":   float(row["RSI3"]) if not pd.isna(row["RSI3"]) else None,
-                "streak": int(row["STREAK"]) if not pd.isna(row["STREAK"]) else 0,
+                "ticker":      ticker,
+                "close":       close,        # Close[d_sig] — base del limit_price
+                "close_entry": close_entry,  # precio de fill simulado
+                "crsi":        float(crsi),
+                "rsi3":        float(row["RSI3"]) if not pd.isna(row["RSI3"]) else None,
+                "streak":      int(row["STREAK"]) if not pd.isna(row["STREAK"]) else 0,
             })
         n_signals_total += len(candidates)
         candidates.sort(key=lambda c: c["crsi"])
@@ -1418,6 +1508,8 @@ def run_connors_backtest(
             if len(positions) >= n_target:
                 break
             limit_p = c["close"] * (1.0 - config.CONNORS_ENTRY_LIMIT)
+            # FILL_AT_CLOSE=True → fill al cierre de D (MOC); si no, al límite.
+            entry_p = c["close_entry"] if config.FILL_AT_CLOSE else limit_p
             # Tamaño efectivo: slot completo si hay cash; si no, recortamos a
             # lo disponible (con margen para comisión). Aceptamos sólo si la
             # apertura cubre ≥ 95 % del slot objetivo.
@@ -1429,17 +1521,17 @@ def run_connors_backtest(
             if effective_slot < slot_size * 0.95:
                 continue
             commis = effective_slot * config.COMMISSION
-            shares = effective_slot / limit_p
+            shares = effective_slot / entry_p
             cash  -= effective_slot + commis
             n_entries += 1
             positions[c["ticker"]] = {
                 "entry_date":       d,
-                "entry_price":      limit_p,
+                "entry_price":      entry_p,
                 "limit_price":      limit_p,
                 "shares":           shares,
                 "valor_compra":     effective_slot,
                 "commission_entry": commis,
-                "stop_loss_price":  limit_p * (1.0 - config.CONNORS_STOP_LOSS),
+                "stop_loss_price":  entry_p * (1.0 - config.CONNORS_STOP_LOSS),
                 "connors_rsi_entrada": c["crsi"],
                 "rsi3_entrada":     c["rsi3"],
                 "streak_entrada":   c["streak"],
@@ -1523,7 +1615,13 @@ def run_connors_backtest(
     _print_backtest_report(
         start_date, end_date, initial_capital, capital_final, closed, len(all_dates),
     )
-    csv = _export_backtest_csv(closed, start_date, end_date) if export else None
+    _sfx_parts = []
+    if config.LOOKAHEAD_FIX:
+        _sfx_parts.append("nolookahead")
+    if config.FILL_AT_CLOSE:
+        _sfx_parts.append("moc")
+    csv_suffix = ("_" + "_".join(_sfx_parts)) if _sfx_parts else ""
+    csv = _export_backtest_csv(closed, start_date, end_date, suffix=csv_suffix) if export else None
     return {"trades": closed, "capital_final": capital_final, "csv": csv}
 
 
@@ -1641,15 +1739,21 @@ _TRADE_COLUMNS = [
 ]
 
 
-def _export_backtest_csv(trades: list, start_date: str, end_date: str) -> Path | None:
+def _export_backtest_csv(
+    trades: list, start_date: str, end_date: str, suffix: str = "",
+) -> Path | None:
     """
     Exporta SIEMPRE un CSV (incluso con 0 trades), para que el usuario sepa
     que el backtest se ejecutó. Si no hay operaciones, escribe sólo la cabecera.
+
+    Params:
+        suffix: cadena opcional añadida al nombre de fichero antes de ".csv"
+                (p.ej. "_nolookahead") para distinguir escenarios.
     """
     _EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     safe_s = start_date.replace("-", "")
     safe_e = end_date.replace("-", "")
-    path   = _EXPORTS_DIR / f"connors_{safe_s}_{safe_e}.csv"
+    path   = _EXPORTS_DIR / f"connors_{safe_s}_{safe_e}{suffix}.csv"
 
     if not trades:
         pd.DataFrame(columns=_TRADE_COLUMNS).to_csv(

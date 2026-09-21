@@ -208,6 +208,7 @@ class AlpacaBroker:
         side: str,
         order_type: str = "market",
         limit_price: float | None = None,
+        moc: bool = False,
     ) -> dict:
         """
         Envía una orden a Alpaca.
@@ -218,6 +219,8 @@ class AlpacaBroker:
             side:        "buy" o "sell".
             order_type:  "market" o "limit".
             limit_price: precio límite (obligatorio si `order_type=="limit"`).
+            moc:         si True, orden de mercado al cierre (Market on Close,
+                         TimeInForce.CLS). Ignorado si order_type=="limit".
 
         Returns:
             dict con `order_id`, `status`, `filled_avg_price`.
@@ -239,9 +242,10 @@ class AlpacaBroker:
                 time_in_force=TimeInForce.DAY, limit_price=limit_price,
             )
         else:
+            tif = TimeInForce.CLS if moc else TimeInForce.DAY
             req = MarketOrderRequest(
                 symbol=ticker, qty=qty, side=side_enum,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=tif,
             )
 
         order = self.trading_client.submit_order(order_data=req)
