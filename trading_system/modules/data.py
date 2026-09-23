@@ -2,7 +2,6 @@
 """Módulo 1 — Obtención de datos de mercado históricos vía yfinance."""
 
 import sys
-import urllib.request
 from pathlib import Path
 from datetime import date, datetime
 
@@ -16,15 +15,6 @@ from modules import yf_cache
 
 console = Console()
 _CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
-
-_SP500_HISTORY_URL = (
-    "https://raw.githubusercontent.com/fja05680/sp500/master/"
-    "S%26P%20500%20Historical%20Components%20%26%20Changes.csv"
-)
-_SP500_HISTORY_CACHE = (
-    Path(__file__).parent.parent / "data" / "sp500_historical_components.csv"
-)
-_SP500_HISTORY_MAX_AGE_DAYS = 7
 
 # Caché en memoria del universo (clave = ruta absoluta del CSV)
 _UNIVERSE_CACHE: dict[str, list[str]] = {}
@@ -238,75 +228,6 @@ def validate_universe(
         console.print("\n[green]Todos los tickers tienen datos.[/green]")
 
     return {"validos": validos, "invalidos": invalidos, "n_total": n_total}
-
-
-def get_sp500_historical_tickers(fecha: str) -> list:
-    """
-    Devuelve la lista de tickers que eran componentes del SP500 en `fecha`
-    (formato YYYY-MM-DD), usando el CSV histórico de fja05680/sp500.
-
-    Estrategia:
-        1. Si el caché local `data/sp500_historical_components.csv` existe y
-           tiene < 7 días → se reutiliza sin descargar.
-        2. Si no, intenta descargar el CSV original.
-        3. Si la descarga falla y NO hay caché local → fallback a
-           `load_universe()` con advertencia en amarillo.
-        4. Sobre el CSV (formato `date,tickers` con tickers separados por
-           comas) busca la fila más cercana ANTERIOR a `fecha`.
-    """
-    _SP500_HISTORY_CACHE.parent.mkdir(parents=True, exist_ok=True)
-
-    needs_download = True
-    if _SP500_HISTORY_CACHE.exists():
-        age_days = (
-            datetime.now() - datetime.fromtimestamp(_SP500_HISTORY_CACHE.stat().st_mtime)
-        ).days
-        needs_download = age_days > _SP500_HISTORY_MAX_AGE_DAYS
-
-    if needs_download:
-        try:
-            console.print(
-                "[cyan]↓ Descargando componentes históricos SP500 (fja05680)...[/cyan]"
-            )
-            urllib.request.urlretrieve(_SP500_HISTORY_URL, _SP500_HISTORY_CACHE)
-            console.print(f"[green]✓ Caché actualizada: {_SP500_HISTORY_CACHE}[/green]")
-        except Exception as exc:
-            console.print(
-                f"[yellow]⚠ No se pudo descargar histórico SP500: {exc}[/yellow]"
-            )
-            if not _SP500_HISTORY_CACHE.exists():
-                console.print(
-                    "[yellow]Usando universo actual de load_universe()[/yellow]"
-                )
-                return load_universe()
-
-    try:
-        df = pd.read_csv(_SP500_HISTORY_CACHE)
-        date_col    = next((c for c in df.columns if "date" in c.lower()), df.columns[0])
-        tickers_col = next(
-            (c for c in df.columns if "ticker" in c.lower()),
-            df.columns[1] if len(df.columns) > 1 else df.columns[0],
-        )
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col]).sort_values(date_col)
-
-        target = pd.Timestamp(fecha)
-        sub    = df[df[date_col] <= target]
-        if sub.empty:
-            sub = df.head(1)
-        tickers_str = str(sub.iloc[-1][tickers_col])
-        tickers = [t.strip() for t in tickers_str.split(",") if t.strip()]
-        if not tickers:
-            raise ValueError("lista de tickers vacía tras parsing")
-        return tickers
-    except Exception as exc:
-        console.print(
-            f"[yellow]⚠ Error parseando CSV histórico SP500: {exc}[/yellow]"
-        )
-        console.print(
-            "[yellow]Usando universo actual de load_universe()[/yellow]"
-        )
-        return load_universe()
 
 
 def get_data(

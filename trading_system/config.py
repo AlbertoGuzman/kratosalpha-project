@@ -57,7 +57,6 @@ CONNORS_ENTRY_CRSI    = 25       # umbral de entrada (CRSI < 25)
 CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
 CONNORS_STOP_LOSS     = 0.05     # 5 %
 CONNORS_TIME_STOP     = 5        # días máximos abierta
-CONNORS_MIN_STREAK    = 3        # nº mínimo de días consecutivos bajando para entrar
 CONNORS_ENTRY_LIMIT   = 0.01     # descuento sobre Close[D-1] para la orden limit
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia
 CONNORS_MAX_POS       = 3        # posiciones simultáneas
@@ -91,76 +90,6 @@ FILL_AT_CLOSE = False
 # Usar junto con LOOKAHEAD_FIX=True: autopiloto a las 15:30 → señales D-1,
 # entradas limit y salidas MOC → operativa coherente con el backtest.
 EXIT_MOC = True
-
-# ── Períodos históricos para backtesting de estrés ────────────────────────────
-# Cada período empieza ANTES de que estalle la crisis para evaluar cómo se
-# comporta el sistema en la fase alcista previa Y luego durante la caída.
-HISTORICAL_PERIODS = {
-    "1": {
-        "nombre": "Pre-Puntocom",
-        "inicio": "1999-01-01",
-        "fin":    "2002-10-31",
-        "crisis": "Marzo 2000",
-        "descripcion": "Sistema arranca 14 meses antes del crash tecnológico",
-        "spy_retorno": "-49%",
-    },
-    "2": {
-        "nombre": "Pre-Crisis Financiera Global",
-        "inicio": "2006-01-01",
-        "fin":    "2009-03-31",
-        "crisis": "Octubre 2007",
-        "descripcion": "Sistema arranca 21 meses antes de Lehman Brothers",
-        "spy_retorno": "-57%",
-    },
-    "3": {
-        "nombre": "Pre-Corrección China + Brexit",
-        "inicio": "2014-01-01",
-        "fin":    "2016-06-30",
-        "crisis": "Junio 2015",
-        "descripcion": "Sistema arranca 18 meses antes del desplome Yuan",
-        "spy_retorno": "-15%",
-    },
-    "4": {
-        "nombre": "Pre-Corrección Q4 2018",
-        "inicio": "2017-01-01",
-        "fin":    "2018-12-31",
-        "crisis": "Octubre 2018",
-        "descripcion": "Sistema arranca 21 meses antes del crash de fin de año",
-        "spy_retorno": "-20%",
-    },
-    "5": {
-        "nombre": "Pre-COVID",
-        "inicio": "2019-06-01",
-        "fin":    "2020-12-31",
-        "crisis": "Febrero 2020",
-        "descripcion": "Sistema arranca 8 meses antes del crash más rápido",
-        "spy_retorno": "-34%",
-    },
-    "6": {
-        "nombre": "Pre-Bajista 2022",
-        "inicio": "2021-01-01",
-        "fin":    "2022-12-31",
-        "crisis": "Enero 2022",
-        "descripcion": "Sistema arranca 12 meses antes de inflación y tipos",
-        "spy_retorno": "-20%",
-    },
-    "7": {
-        "nombre": "Out-of-sample 2010-2019",
-        "inicio": "2010-01-01",
-        "fin":    "2019-12-31",
-        "crisis": "Varias correcciones",
-        "descripcion": "Período no usado en optimización — 3 correcciones incluidas",
-        "spy_retorno": "+257%",
-    },
-    "8": {
-        "nombre": "Histórico completo 1999-2026",
-        "inicio": "1999-01-01",
-        "fin":    "2026-05-23",
-        "crisis": "Todas",
-        "descripcion": "Todo el histórico disponible — todas las crisis",
-        "spy_retorno": "+450%",
-    },
-}
 
 # ── Alpaca Markets ────────────────────────────────────────────────────────────
 # Integración con Alpaca para enviar órdenes simuladas o reales. SQLite sigue

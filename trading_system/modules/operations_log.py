@@ -331,7 +331,6 @@ def estadisticas_por_ticker(
 # ── E. Filtrar trades ─────────────────────────────────────────────────────────
 
 def filtrar_trades(
-    estrategia: str | None = None,
     ticker: str | None = None,
     fecha_desde: str | None = None,
     fecha_hasta: str | None = None,
@@ -532,7 +531,6 @@ def evolucion_capital(db_path: Path | str | None = None) -> None:
 
 def _ask_filtros() -> dict:
     """Diálogo para construir un dict de filtros para `filtrar_trades`."""
-    estr   = "CONNORS"
     ticker = Prompt.ask("  Ticker (Enter=todos)", default="").strip().upper() or None
     desde  = Prompt.ask("  Fecha desde YYYY-MM-DD (Enter=sin límite)", default="").strip() or None
     hasta  = Prompt.ask("  Fecha hasta YYYY-MM-DD (Enter=sin límite)", default="").strip() or None
@@ -540,7 +538,7 @@ def _ask_filtros() -> dict:
     g      = Prompt.ask("  Solo ganadoras (y/n/Enter=todas)", default="").strip().lower()
     solo_g = True if g == "y" else (False if g == "n" else None)
     return {
-        "estrategia": estr, "ticker": ticker,
+        "ticker": ticker,
         "fecha_desde": desde, "fecha_hasta": hasta,
         "motivo": motivo, "solo_ganadoras": solo_g,
     }

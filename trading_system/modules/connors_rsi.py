@@ -11,7 +11,6 @@ import sys
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime, timedelta
-from itertools import product
 
 import numpy as np
 import pandas as pd

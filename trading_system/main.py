@@ -53,7 +53,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config
 from modules.logger import get_system_logger, get_trading_logger
 from modules.data import load_universe, validate_universe, es_dia_habil_nyse
-from modules.data import get_sp500_historical_tickers
 from modules.operations_log import menu as operations_log_menu
 from modules.connors_rsi import (
     menu as connors_menu, get_capital_summary_connors,
@@ -206,8 +205,7 @@ def _opcion_validar_universo() -> None:
 
 
 def _opcion_ver_logs() -> None:
-    """Opción 7 — Visor de logs (system / trading)."""
-    from modules.logger import get_system_logger, get_trading_logger
+    """Opción 6 — Visor de logs (system / trading)."""
     _LOGS_DIR = Path(__file__).parent / "logs"
 
     def _log_path(prefix: str, fecha_str: str | None = None) -> Path | None:
@@ -508,7 +506,7 @@ def _tabla_ordenes_alpaca(orders) -> None:
 
 
 def _opcion_alpaca_estado() -> None:
-    """Opción 9 — Dashboard de estado: panel de capital + posiciones + órdenes."""
+    """Opción 7 — Dashboard de estado: panel de capital + posiciones + órdenes."""
     alpaca_on = getattr(config, "ALPACA_ENABLED", False)
     broker = acc = positions = orders = None
 
@@ -539,388 +537,6 @@ def _opcion_alpaca_estado() -> None:
 
     _tabla_posiciones_alpaca(positions)
     _tabla_ordenes_alpaca(orders)
-
-
-_MESES_ES = {
-    "enero":      1,  "febrero":   2,  "marzo":     3,  "abril":   4,
-    "mayo":       5,  "junio":     6,  "julio":     7,  "agosto":  8,
-    "septiembre": 9,  "octubre":  10,  "noviembre": 11, "diciembre": 12,
-}
-
-
-def _parse_crisis_date(crisis_str: str) -> datetime | None:
-    """`'Octubre 2007'` → datetime(2007, 10, 1). None si no parseable."""
-    if not crisis_str:
-        return None
-    parts = crisis_str.strip().split()
-    if len(parts) != 2:
-        return None
-    mes = _MESES_ES.get(parts[0].lower())
-    if mes is None:
-        return None
-    try:
-        return datetime(int(parts[1]), mes, 1)
-    except Exception:
-        return None
-
-
-def _parse_spy_pct(spy_str: str) -> float | None:
-    """`'-57%'` → -57.0. None si no parseable."""
-    try:
-        return float(spy_str.rstrip("%").replace("+", "").replace(",", "."))
-    except Exception:
-        return None
-
-
-def _split_trades_by_date(trades: list, crisis_dt: datetime) -> tuple[list, list]:
-    """Divide trades en (pre_crisis, durante_crisis) según `exit_date`."""
-    pre, post = [], []
-    for t in trades:
-        ed = t.get("exit_date")
-        try:
-            if hasattr(ed, "to_pydatetime"):
-                d = ed.to_pydatetime()
-            elif isinstance(ed, datetime):
-                d = ed
-            elif isinstance(ed, date):
-                d = datetime(ed.year, ed.month, ed.day)
-            else:
-                d = datetime.fromisoformat(str(ed)[:10])
-        except Exception:
-            pre.append(t)
-            continue
-        if d < crisis_dt:
-            pre.append(t)
-        else:
-            post.append(t)
-    return pre, post
-
-
-def _phase_stats(trades: list, capital_inicio_fase: float) -> dict:
-    """Métricas agregadas de una fase: pnl, n, wins, wr, rent, capital_final."""
-    pnl    = sum(t.get("net_pnl", 0.0) for t in trades)
-    n      = len(trades)
-    wins   = sum(1 for t in trades if t.get("net_pnl", 0.0) > 0)
-    wr     = (wins / n * 100) if n else 0.0
-    rent   = (pnl / capital_inicio_fase * 100) if capital_inicio_fase else 0.0
-    return {
-        "pnl":           pnl,
-        "n":             n,
-        "wins":          wins,
-        "wr":            wr,
-        "rent":          rent,
-        "capital_final": capital_inicio_fase + pnl,
-    }
-
-
-def _phase_section_text(label: str, s: dict, spy_pct: float | None = None) -> Text:
-    """Genera la sub-sección Rich con la métrica de una fase para una estrategia."""
-    rent_col = "green" if s["rent"] >= 0 else "red"
-    diff_lbl = ""
-    if spy_pct is not None:
-        diff_lbl = f"  (vs SPY: {s['rent'] - spy_pct:+.1f}pp)"
-    out = Text()
-    out.append(f"  {label}\n", style="bold cyan")
-    out.append("    Rentabilidad  : ", style="white")
-    out.append(f"{s['rent']:+.2f} %{diff_lbl}\n", style=f"bold {rent_col}")
-    out.append(f"    Operaciones   : {s['n']}  (WR {s['wr']:.1f} %)\n", style="white")
-    out.append(f"    Capital final : {s['capital_final']:,.2f} €\n", style="white")
-    return out
-
-
-def _validate_tickers_for_period(tickers: list, start_date: str) -> tuple[list, list]:
-    """
-    Verifica con yfinance qué tickers tienen datos al inicio del período
-    (con margen para los indicadores). Devuelve (válidos, excluidos).
-
-    Usa una descarga batch con `group_by="ticker"` para minimizar latencia
-    en universos grandes (~500 tickers).
-    """
-    import yfinance as yf
-    target      = datetime.strptime(start_date, "%Y-%m-%d")
-    check_start = (target - timedelta(days=120)).strftime("%Y-%m-%d")
-    check_end   = (target + timedelta(days=5)).strftime("%Y-%m-%d")
-
-    validos: list = []
-    excluidos: list = []
-    chunk_size = 50
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i + chunk_size]
-        try:
-            df = yf.download(
-                chunk, start=check_start, end=check_end,
-                auto_adjust=True, progress=False, group_by="ticker",
-                threads=True,
-            )
-        except Exception:
-            excluidos.extend(chunk)
-            continue
-        if df is None or df.empty:
-            excluidos.extend(chunk)
-            continue
-        for t in chunk:
-            try:
-                if isinstance(df.columns, pd.MultiIndex):
-                    if t in df.columns.get_level_values(0):
-                        sub = df[t].dropna(how="all")
-                    else:
-                        excluidos.append(t)
-                        continue
-                else:
-                    sub = df.dropna(how="all")
-                if not sub.empty and len(sub) >= 3:
-                    validos.append(t)
-                else:
-                    excluidos.append(t)
-            except Exception:
-                excluidos.append(t)
-    return validos, excluidos
-
-
-def _opcion_historical_backtests() -> None:
-    """
-    Opción 7 — Backtesting sobre períodos históricos predefinidos, usando el
-    universo SP500 que realmente cotizaba en cada momento (vía fja05680).
-    """
-    # ── 1) Selección de período ──────────────────────────────────────────────
-    table = Table(
-        title="[bold cyan]Períodos históricos disponibles[/bold cyan]",
-        box=box.ROUNDED, border_style="cyan", show_header=True,
-    )
-    table.add_column("Nº",          justify="center", style="bold cyan")
-    table.add_column("Nombre",      justify="left")
-    table.add_column("Período",     justify="center")
-    table.add_column("Crisis en",   justify="center")
-    table.add_column("SPY crisis",  justify="right")
-    table.add_column("Descripción", justify="left")
-    for k, p in config.HISTORICAL_PERIODS.items():
-        table.add_row(
-            k, p["nombre"],
-            f"{p['inicio']} → {p['fin']}",
-            p.get("crisis", "—"),
-            p["spy_retorno"],
-            p["descripcion"],
-        )
-    console.print(table)
-
-    pid = Prompt.ask(
-        "\n  Período",
-        choices=list(config.HISTORICAL_PERIODS.keys()),
-        default=list(config.HISTORICAL_PERIODS.keys())[-1],
-    )
-    periodo = config.HISTORICAL_PERIODS[pid]
-
-    # Slug del nombre del período (se usa en los nombres de fichero exportados)
-    safe_nombre = (
-        periodo["nombre"].lower()
-        .replace(" ", "_").replace("ó", "o").replace("í", "i")
-        .replace("á", "a").replace("é", "e").replace("ú", "u")
-        .replace("ñ", "n").replace("+", "_").replace("/", "_")
-    )
-    while "__" in safe_nombre:          # colapsa "_+_" → "___" → "_"
-        safe_nombre = safe_nombre.replace("__", "_")
-    safe_nombre = safe_nombre.strip("_")
-
-    # ── 3) Universo histórico + validación ──────────────────────────────────
-    console.print(
-        f"\n[cyan]Obteniendo universo histórico SP500 a fecha "
-        f"{periodo['inicio']}...[/cyan]"
-    )
-    tickers_hist = get_sp500_historical_tickers(periodo["inicio"])
-    console.print(
-        f"[white]Universo histórico: {len(tickers_hist)} tickers "
-        f"para {periodo['inicio']}[/white]"
-    )
-
-    console.print(
-        f"[cyan]Validando disponibilidad de datos en yfinance "
-        f"(esto puede tardar 1-2 min para universos grandes)...[/cyan]"
-    )
-    validos, excluidos = _validate_tickers_for_period(
-        tickers_hist, periodo["inicio"],
-    )
-    n_val = len(validos)
-    console.print(f"  [green]Tickers válidos   : {n_val}[/green]")
-    console.print(f"  [dim]Tickers excluidos : {len(excluidos)} (sin datos)[/dim]")
-
-    if n_val < 10:
-        console.print(
-            "[bold red]⛔ Sólo "
-            f"{n_val} tickers válidos. Resultado poco fiable.[/bold red]"
-        )
-        if not Confirm.ask("¿Continuar igualmente?", default=False):
-            return
-    elif n_val < 20:
-        console.print(
-            f"[yellow]⚠ Pocos tickers válidos ({n_val}). "
-            f"Resultado puede ser ruidoso.[/yellow]"
-        )
-
-    # ── 4) Ejecutar backtest ConnorsRSI ──────────────────────────────────────
-    resultados: dict = {}
-    console.print(f"\n[bold cyan]▶ Backtest ConnorsRSI {periodo['nombre']}[/bold cyan]")
-    resultados["connors"] = run_connors_backtest(
-        tickers=validos,
-        start_date=periodo["inicio"],
-        end_date=periodo["fin"],
-    )
-    # `run_connors_backtest` exporta a `connors_{start}_{end}.csv`; le
-    # añadimos el slug del período al nombre para distinguir entre
-    # backtests históricos diferentes con el mismo rango de fechas.
-    csv_path = resultados["connors"].get("csv") if resultados["connors"] else None
-    if csv_path:
-        csv_path = Path(csv_path)
-        new_name = csv_path.name.replace(
-            "connors_", f"connors_HIST_{safe_nombre}_", 1,
-        )
-        new_path = csv_path.with_name(new_name)
-        try:
-            csv_path.rename(new_path)
-            resultados["connors"]["csv"] = new_path
-            console.print(
-                f"[green]✓ CSV ConnorsRSI renombrado: {new_path.name}[/green]"
-            )
-        except Exception as exc:
-            console.print(
-                f"[yellow]⚠ No se pudo renombrar CSV ConnorsRSI: {exc}[/yellow]"
-            )
-
-    # ── 5) Resumen comparativo con 3 fases ──────────────────────────────────
-    crisis_dt = _parse_crisis_date(periodo.get("crisis", ""))
-
-    body = Text()
-    body.append(f"  PERÍODO: {periodo['nombre']}\n", style="bold cyan")
-    body.append(
-        f"  Simulación: {periodo['inicio']} → {periodo['fin']}\n", style="white",
-    )
-    if crisis_dt is not None:
-        body.append(f"  Crisis estalló: {periodo['crisis']}\n", style="yellow")
-    else:
-        body.append(f"  Crisis: {periodo.get('crisis', '—')}\n", style="dim")
-    body.append(f"  SPY durante crisis: {periodo['spy_retorno']}\n", style="dim")
-    body.append(f"  Universo: {n_val} tickers históricos\n", style="white")
-    body.append("\n")
-
-    initial_by_key = {
-        "connors": config.CONNORS_CAPITAL,
-    }
-    label_by_key = {
-        "connors": "CONNORS RSI",
-    }
-
-    spy_pct = _parse_spy_pct(periodo["spy_retorno"])
-
-    # ── FASE 1 + FASE 2 (sólo si hay fecha de crisis parseable) ────────────
-    if crisis_dt is not None:
-        body.append(
-            f"  ── FASE 1 — Pre-crisis ({periodo['inicio']} → "
-            f"{crisis_dt.strftime('%Y-%m-%d')}) ──\n",
-            style="bold green",
-        )
-        for key, res in resultados.items():
-            if not res:
-                continue
-            trades = res.get("trades", [])
-            pre, _ = _split_trades_by_date(trades, crisis_dt)
-            s = _phase_stats(pre, initial_by_key[key])
-            body.append(_phase_section_text(label_by_key[key], s))
-        body.append("\n")
-
-        body.append(
-            f"  ── FASE 2 — Durante crisis ({crisis_dt.strftime('%Y-%m-%d')} → "
-            f"{periodo['fin']}) ──\n",
-            style="bold red",
-        )
-        for key, res in resultados.items():
-            if not res:
-                continue
-            trades = res.get("trades", [])
-            pre, post = _split_trades_by_date(trades, crisis_dt)
-            cap_inicio_fase2 = initial_by_key[key] + sum(t.get("net_pnl", 0) for t in pre)
-            s = _phase_stats(post, cap_inicio_fase2)
-            body.append(_phase_section_text(
-                label_by_key[key], s,
-                spy_pct=spy_pct,
-            ))
-        body.append("\n")
-
-    # ── RESULTADO GLOBAL ────────────────────────────────────────────────────
-    body.append("  ── RESULTADO GLOBAL ──\n", style="bold cyan")
-    for key, res in resultados.items():
-        if not res:
-            continue
-        trades = res.get("trades", [])
-        s = _phase_stats(trades, initial_by_key[key])
-        body.append(_phase_section_text(label_by_key[key], s))
-    body.append(f"  SPY período completo: {periodo['spy_retorno']}\n", style="dim")
-
-    console.print(Panel(
-        body,
-        title="[bold white]RESUMEN BACKTEST HISTÓRICO[/bold white]",
-        border_style="cyan", box=box.DOUBLE_EDGE, padding=(1, 2),
-    ))
-
-    # ── 6) Exportar resumen a TXT (con 3 fases) ─────────────────────────────
-    exports_dir = Path(__file__).parent / "exports"
-    exports_dir.mkdir(parents=True, exist_ok=True)
-    fpath = exports_dir / (
-        f"historical_{safe_nombre}_{date.today().strftime('%Y%m%d')}.txt"
-    )
-
-    lines: list = []
-    sep = "=" * 70
-    lines.append(sep)
-    lines.append(f"  BACKTEST HISTÓRICO · {periodo['nombre']}")
-    lines.append(f"  Simulación: {periodo['inicio']}  →  {periodo['fin']}")
-    lines.append(f"  Crisis: {periodo.get('crisis', '—')}")
-    lines.append(f"  SPY durante crisis: {periodo['spy_retorno']}")
-    lines.append(f"  Universo: {n_val} tickers (de {len(tickers_hist)})")
-    lines.append(sep)
-    lines.append("")
-
-    def _phase_lines(label, s):
-        return [
-            f"  {label}",
-            f"    Rentabilidad : {s['rent']:+.2f} %",
-            f"    PnL          : {s['pnl']:+,.2f} €",
-            f"    Operaciones  : {s['n']}  ({s['wins']} ganadoras)",
-            f"    Win rate     : {s['wr']:.1f} %",
-            f"    Capital final: {s['capital_final']:,.2f} €",
-        ]
-
-    if crisis_dt is not None:
-        lines.append(
-            f"— FASE 1 — Pre-crisis ({periodo['inicio']} → "
-            f"{crisis_dt.strftime('%Y-%m-%d')}) —"
-        )
-        for key, res in resultados.items():
-            if not res: continue
-            trades = res.get("trades", [])
-            pre, _ = _split_trades_by_date(trades, crisis_dt)
-            lines.extend(_phase_lines(label_by_key[key], _phase_stats(pre, initial_by_key[key])))
-            lines.append("")
-        lines.append(
-            f"— FASE 2 — Durante crisis ({crisis_dt.strftime('%Y-%m-%d')} → "
-            f"{periodo['fin']}) —"
-        )
-        for key, res in resultados.items():
-            if not res: continue
-            trades = res.get("trades", [])
-            pre, post = _split_trades_by_date(trades, crisis_dt)
-            cap_inicio_fase2 = initial_by_key[key] + sum(t.get("net_pnl", 0) for t in pre)
-            lines.extend(_phase_lines(label_by_key[key], _phase_stats(post, cap_inicio_fase2)))
-            lines.append("")
-
-    lines.append("— RESULTADO GLOBAL —")
-    for key, res in resultados.items():
-        if not res: continue
-        trades = res.get("trades", [])
-        lines.extend(_phase_lines(label_by_key[key], _phase_stats(trades, initial_by_key[key])))
-        lines.append("")
-    lines.append(f"SPY período completo: {periodo['spy_retorno']}")
-
-    fpath.write_text("\n".join(lines), encoding="utf-8")
-    console.print(f"\n[green]✓ Resumen exportado: {fpath}[/green]")
 
 
 # ── Opción 1 — Autopiloto (ConnorsRSI) ───────────────────────────────────────
@@ -1420,14 +1036,12 @@ def _print_menu() -> None:
     menu.append("  3", style="bold cyan")
     menu.append(". Resumen de capital\n", style="white")
     menu.append("  4", style="bold cyan")
-    menu.append(". Backtesting períodos históricos\n", style="white")
-    menu.append("  5", style="bold cyan")
     menu.append(". Operations Log\n", style="white")
-    menu.append("  6", style="bold cyan")
+    menu.append("  5", style="bold cyan")
     menu.append(". Validar universo (yfinance)\n", style="white")
-    menu.append("  7", style="bold cyan")
+    menu.append("  6", style="bold cyan")
     menu.append(". Ver logs\n", style="white")
-    menu.append("  8", style="bold cyan")
+    menu.append("  7", style="bold cyan")
     menu.append(". Estado Alpaca\n", style="white")
     menu.append("  0", style="bold red")
     menu.append(". Salir\n", style="white")
@@ -1448,11 +1062,10 @@ _OPTIONS = {
     "1": _opcion_autopiloto,
     "2": _opcion_connors_submenu,
     "3": _opcion_capital,
-    "4": _opcion_historical_backtests,
-    "5": _opcion_operations_log,
-    "6": _opcion_validar_universo,
-    "7": _opcion_ver_logs,
-    "8": _opcion_alpaca_estado,
+    "4": _opcion_operations_log,
+    "5": _opcion_validar_universo,
+    "6": _opcion_ver_logs,
+    "7": _opcion_alpaca_estado,
 }
 
 

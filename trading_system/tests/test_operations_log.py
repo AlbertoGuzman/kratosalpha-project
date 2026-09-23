@@ -86,8 +86,8 @@ class TestFiltrarTrades:
         estr = {t["estrategia"] for t in r}
         assert estr == {"CONNORS"}
 
-    def test_filtro_estrategia_connors(self, db_with_data):
-        r = filtrar_trades(estrategia="CONNORS", db_path=db_with_data)
+    def test_todos_los_trades_son_connors(self, db_with_data):
+        r = filtrar_trades(db_path=db_with_data)
         assert len(r) == 5
         assert all(t["estrategia"] == "CONNORS" for t in r)
 

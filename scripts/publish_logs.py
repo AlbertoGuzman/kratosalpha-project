@@ -131,16 +131,12 @@ def _recopilar_operaciones(db_path, precios: dict) -> list:
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     try:
-        for estado_filtro in ("cerrada",):
-            try:
-                rows = con.execute(
-                    "SELECT ticker, entry_date, entry_price, exit_date, exit_price "
-                    "FROM connors_operaciones "
-                    "WHERE estado = ? AND COALESCE(exit_date, '') <> ''",
-                    (estado_filtro,),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
+        try:
+            rows = con.execute(
+                "SELECT ticker, entry_date, entry_price, exit_date, exit_price "
+                "FROM connors_operaciones "
+                "WHERE estado = 'cerrada' AND COALESCE(exit_date, '') <> ''"
+            ).fetchall()
             for r in rows:
                 ep = float(r["entry_price"]) if r["entry_price"] else None
                 xp = float(r["exit_price"]) if r["exit_price"] is not None else None
@@ -155,16 +151,14 @@ def _recopilar_operaciones(db_path, precios: dict) -> list:
                     "pnl_pct":  pnl,
                     "estado":   "Cerrada",
                 })
+        except sqlite3.OperationalError:
+            pass
 
-        for estado_filtro in ("abierta",):
-            try:
-                rows = con.execute(
-                    "SELECT ticker, entry_date, entry_price FROM connors_operaciones "
-                    "WHERE estado = ?",
-                    (estado_filtro,),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
+        try:
+            rows = con.execute(
+                "SELECT ticker, entry_date, entry_price FROM connors_operaciones "
+                "WHERE estado = 'abierta'"
+            ).fetchall()
             for r in rows:
                 ep = float(r["entry_price"]) if r["entry_price"] else None
                 pa = precios.get(r["ticker"])
@@ -180,6 +174,8 @@ def _recopilar_operaciones(db_path, precios: dict) -> list:
                     "pnl_pct":  pnl,
                     "estado":   "Abierta",
                 })
+        except sqlite3.OperationalError:
+            pass
     finally:
         con.close()
     return ops
