@@ -1367,6 +1367,7 @@ def run_connors_backtest(
     cash            = initial_capital
     positions: dict = {}
     closed: list    = []
+    daily_prices: dict = {}  # {ticker: [{fecha, open, close, entry_date, entry_price}]}
 
     console.print(
         f"[bold cyan]Backtest ConnorsRSI {start_date} → {end_date}  "
@@ -1536,6 +1537,21 @@ def run_connors_backtest(
                 "streak_entrada":   c["streak"],
             }
 
+        # ── Precio diario de cada posición abierta ───────────────────────────
+        for ticker, pos in positions.items():
+            ind = indicators.get(ticker)
+            if ind is None or d not in ind.index:
+                continue
+            row_d = ind.loc[d]
+            daily_prices.setdefault(ticker, []).append({
+                "ticker":      ticker,
+                "entry_date":  pos["entry_date"].date(),
+                "entry_price": pos["entry_price"],
+                "fecha":       d.date(),
+                "open":        float(row_d["Open"]),
+                "close":       float(row_d["Close"]),
+            })
+
     # Cierre final
     final_d = all_dates[-1]
     for ticker in list(positions.keys()):
@@ -1620,8 +1636,9 @@ def run_connors_backtest(
     if config.FILL_AT_CLOSE:
         _sfx_parts.append("moc")
     csv_suffix = ("_" + "_".join(_sfx_parts)) if _sfx_parts else ""
-    csv = _export_backtest_csv(closed, start_date, end_date, suffix=csv_suffix) if export else None
-    return {"trades": closed, "capital_final": capital_final, "csv": csv}
+    csv       = _export_backtest_csv(closed, start_date, end_date, suffix=csv_suffix) if export else None
+    daily_csv = _export_backtest_daily_csv(daily_prices, start_date, end_date, suffix=csv_suffix) if export else None
+    return {"trades": closed, "capital_final": capital_final, "csv": csv, "daily_csv": daily_csv}
 
 
 def get_capital_summary_connors() -> dict:
@@ -1766,6 +1783,43 @@ def _export_backtest_csv(
 
     pd.DataFrame(trades).to_csv(path, index=False, encoding="utf-8-sig")
     console.print(f"\n[green]✓ Operaciones ConnorsRSI exportadas: {path}[/green]")
+    return path
+
+
+_DAILY_COLUMNS = ["ticker", "entry_date", "entry_price", "fecha", "open", "close"]
+
+
+def _export_backtest_daily_csv(
+    daily_prices: dict, start_date: str, end_date: str, suffix: str = "",
+) -> Path | None:
+    """
+    Exporta un CSV con el precio de apertura y cierre de cada ticker
+    por cada día que la operación estuvo abierta.
+
+    Params:
+        daily_prices: dict {ticker: [{fecha, open, close, entry_date, entry_price}]}
+        suffix:       sufijo opcional igual que en _export_backtest_csv.
+    Returns:
+        Path al CSV generado, o None si no hay datos.
+    """
+    _EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_s = start_date.replace("-", "")
+    safe_e = end_date.replace("-", "")
+    path   = _EXPORTS_DIR / f"connors_daily_{safe_s}_{safe_e}{suffix}.csv"
+
+    filas = [fila for registros in daily_prices.values() for fila in registros]
+    if not filas:
+        pd.DataFrame(columns=_DAILY_COLUMNS).to_csv(
+            path, index=False, encoding="utf-8-sig"
+        )
+        console.print(
+            f"[yellow]⚠ Sin datos diarios · CSV vacío exportado: {path}[/yellow]"
+        )
+        return path
+
+    df = pd.DataFrame(filas)[_DAILY_COLUMNS].sort_values(["ticker", "fecha"])
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    console.print(f"[green]✓ Precios diarios exportados: {path}[/green]")
     return path
 
 
