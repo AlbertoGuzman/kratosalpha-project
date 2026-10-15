@@ -8,6 +8,7 @@ modules/data.py).
 """
 
 import sys
+import math
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS connors_operaciones (
     valor_compra        REAL    CHECK (valor_compra IS NULL OR valor_compra >= 0),
     slot_size           REAL    CHECK (slot_size IS NULL OR slot_size >= 0),
     stop_loss_price     REAL    CHECK (stop_loss_price IS NULL OR stop_loss_price > 0),
+    alpaca_sl_order_id  TEXT,
     commission_entry    REAL    DEFAULT 0.0,
     connors_rsi_entrada REAL,
     rsi3_entrada        REAL,
@@ -115,6 +117,13 @@ def _init_db() -> None:
             stmt = stmt.strip()
             if stmt:
                 con.execute(stmt)
+        # Migración: añadir alpaca_sl_order_id a BDs existentes sin la columna.
+        try:
+            con.execute(
+                "ALTER TABLE connors_operaciones ADD COLUMN alpaca_sl_order_id TEXT"
+            )
+        except Exception:
+            pass  # columna ya existe
         row = con.execute("SELECT COUNT(*) AS n FROM connors_capital").fetchone()
         if row["n"] == 0:
             con.execute(
@@ -216,6 +225,44 @@ def _get_pending_sells() -> set:
         return set()
 
 
+def _cierres_alpaca_pendientes(positions: dict, pendings: dict) -> int:
+    """
+    Número de posiciones que ya están 'cerrada' en SQLite pero siguen abiertas
+    en Alpaca porque su orden de cierre (MOC u otro) aún no se ha ejecutado.
+
+    Compara los tickers activos en SQLite (abierta+pendiente) con los que
+    Alpaca reporta como posiciones abiertas. La diferencia son cierres en
+    tránsito que ocupan un slot real en el broker aunque SQLite ya los contabilice
+    como libres.
+
+    Si Alpaca no está habilitado o no responde, devuelve 0 (comportamiento
+    anterior, sin penalización extra).
+
+    Params:
+        positions: dict devuelto por _get_open_positions() (estado='abierta').
+        pendings:  dict devuelto por _get_pending_orders()  (estado='pendiente').
+    Returns:
+        Número de slots bloqueados por cierres Alpaca pendientes.
+    """
+    if not getattr(config, "ALPACA_ENABLED", False):
+        return 0
+    try:
+        from modules.alpaca_broker import get_broker
+        broker = get_broker()
+        alpaca_tickers = {p["ticker"] for p in broker.get_positions()}
+        active_tickers = set(positions) | set(pendings)
+        ghost = alpaca_tickers - active_tickers
+        if ghost:
+            _slog.info(
+                "Cierres Alpaca pendientes (bloquean slot): %s",
+                sorted(ghost),
+            )
+        return len(ghost)
+    except Exception as exc:
+        _slog.warning("_cierres_alpaca_pendientes: no se pudo consultar Alpaca: %s", exc)
+        return 0
+
+
 def _count_pending_orders() -> int:
     """Número de órdenes pendientes (cuenta como slots ocupados)."""
     _init_db()
@@ -301,6 +348,274 @@ def _materialize_pending_as_position(
         operacion_id=op_id,
     )
 
+    # Stop-limit nativa (si el flag está activo): usa filled_qty real, no teórico.
+    # Alpaca no admite stop-limit GTC fraccionaria → floor defensivo.
+    if getattr(config, "ALPACA_NATIVE_SL", False) and getattr(config, "ALPACA_ENABLED", False):
+        try:
+            from modules.alpaca_broker import get_broker
+            broker = get_broker()
+            sl_price  = fill_price * (1.0 - config.CONNORS_STOP_LOSS)
+            sl_shares = math.floor(filled_qty)
+            if sl_shares <= 0:
+                _slog.warning(
+                    "stop nativa omitida %s: filled_qty=%.4f < 1 acción entera",
+                    pending["ticker"], filled_qty,
+                )
+            else:
+                _send_native_sl(broker, pending["ticker"], sl_shares, sl_price, op_id)
+        except Exception as exc:
+            _slog.warning(
+                "no se pudo obtener broker para stop nativa %s: %s",
+                pending["ticker"], exc,
+            )
+
+
+def _send_native_sl(broker, ticker: str, shares: float, sl_price: float, op_id: int) -> str | None:
+    """
+    Envía la stop-limit GTC a Alpaca y guarda el order_id en SQLite.
+    Devuelve el order_id si tuvo éxito, None si falló (la posición cae a
+    chequeo por precio como fallback — alpaca_sl_order_id sigue NULL).
+
+    Params:
+        broker:   instancia AlpacaBroker activa.
+        ticker:   símbolo.
+        shares:   cantidad real ejecutada (fill, no teórica).
+        sl_price: nivel stop_loss_price ya calculado y guardado en la operación.
+        op_id:    id de la operación en connors_operaciones.
+    """
+    margin = getattr(config, "ALPACA_NATIVE_SL_LIMIT_MARGIN", 0.005)
+    try:
+        resp = broker.submit_stop_order(ticker, shares, sl_price, limit_margin=margin)
+        sl_order_id = resp["order_id"]
+        with _get_connection() as con:
+            con.execute(
+                "UPDATE connors_operaciones SET alpaca_sl_order_id = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (sl_order_id, op_id),
+            )
+        _slog.info(
+            "stop nativa enviada: %s  sl=%.2f  order_id=%s",
+            ticker, sl_price, sl_order_id,
+        )
+        _tlog.info("[CONNORS] STOP_NATIVA %-6s · sl=%.2f · order_id=%s", ticker, sl_price, sl_order_id)
+        return sl_order_id
+    except Exception as exc:
+        console.print(
+            f"  [yellow]⚠ {ticker}: stop nativa rechazada por Alpaca — {exc}. "
+            f"Fallback: chequeo SL por precio en batch.[/yellow]"
+        )
+        _slog.warning("stop nativa rechazada %s: %s — fallback a chequeo batch", ticker, exc)
+        return None
+
+
+def _reconcile_sl_orders() -> None:
+    """
+    Reconcilia las stop-limit nativas con Alpaca. Se llama al inicio de
+    `_check_pending_orders()`. Maneja dos casos:
+
+    A) Posición 'abierta' con alpaca_sl_order_id IS NOT NULL:
+       - filled   → la stop se disparó mientras el sistema estaba parado; cierra
+                    en SQLite con reason='SL' y el precio real de Alpaca.
+       - cancelled / expired / not found → borra alpaca_sl_order_id (la posición
+                    cae al chequeo por precio como fallback automático).
+       - active   → sin acción.
+
+    B) Posición 'abierta' con alpaca_sl_order_id IS NULL y ALPACA_NATIVE_SL=True:
+       (migración retroactiva al activar el flag con posiciones ya abiertas)
+       → intenta enviar la stop order ahora; si falla, la posición sigue con
+         chequeo batch (NULL permanece, fallback automático).
+    """
+    if not getattr(config, "ALPACA_ENABLED", False):
+        return
+    if not getattr(config, "ALPACA_NATIVE_SL", False):
+        return
+
+    positions = _get_open_positions()
+    if not positions:
+        return
+
+    try:
+        from modules.alpaca_broker import get_broker
+        broker = get_broker()
+    except Exception as exc:
+        _slog.warning("_reconcile_sl_orders: no se pudo conectar a Alpaca: %s", exc)
+        return
+
+    for ticker, pos in positions.items():
+        op_id = pos.get("id")
+        sl_order_id = pos.get("alpaca_sl_order_id")
+
+        if sl_order_id:
+            # Caso A: verificar estado de la stop nativa existente.
+            try:
+                order = broker.get_order(sl_order_id)
+            except Exception as exc:
+                _slog.warning(
+                    "_reconcile_sl_orders: no se pudo consultar stop %s ticker=%s: %s",
+                    sl_order_id, ticker, exc,
+                )
+                continue
+
+            status = order.get("status", "").lower()
+            if status == "filled":
+                # Stop ejecutada mientras el sistema estaba caído → cerrar en SQLite.
+                fill_p = float(order.get("filled_avg_price") or pos["stop_loss_price"])
+                console.print(
+                    f"[red]⚡ {ticker}: stop nativa ejecutada (fill={fill_p:.2f}) "
+                    f"— reconciliando cierre SL[/red]"
+                )
+                _slog.info(
+                    "_reconcile_sl_orders: stop ejecutada %s fill=%.2f", ticker, fill_p
+                )
+                # Cerrar en SQLite con idempotencia: UPDATE solo si sigue 'abierta'.
+                shares           = pos["shares"]
+                entry_p          = pos["entry_price"]
+                val_compra       = pos["valor_compra"]
+                comm_entry       = pos.get("commission_entry") or val_compra * config.COMMISSION
+                comm_exit        = shares * fill_p * config.COMMISSION
+                gross            = shares * (fill_p - entry_p)
+                net              = gross - comm_entry - comm_exit
+                ret_pct          = (fill_p - entry_p) / entry_p if entry_p else 0.0
+                try:
+                    entry_d = datetime.fromisoformat(pos["entry_date"]).date()
+                    dias    = (date.today() - entry_d).days
+                except Exception:
+                    dias = 0
+                with _get_connection() as con:
+                    cur = con.execute(
+                        "UPDATE connors_operaciones SET "
+                        "  estado='cerrada', exit_date=?, exit_price=?, "
+                        "  commission_entry=COALESCE(commission_entry,?), "
+                        "  commission_exit=?, gross_pnl=?, net_pnl=?, "
+                        "  return_pct=?, dias=?, reason='SL', "
+                        "  updated_at=datetime('now') "
+                        "WHERE id=? AND estado='abierta'",
+                        (
+                            date.today().isoformat(), fill_p, comm_entry,
+                            comm_exit, gross, net, ret_pct, dias, op_id,
+                        ),
+                    )
+                    rows_affected = cur.rowcount
+                if rows_affected == 0:
+                    # La posición ya fue cerrada por otra vía → idempotencia OK.
+                    _slog.info(
+                        "_reconcile_sl_orders: %s ya estaba cerrada — skip", ticker
+                    )
+                    continue
+                cash  = _get_current_cash() + shares * fill_p - comm_exit
+                val_pos = sum(
+                    p["shares"] * (_last_close(t) or p["entry_price"])
+                    for t, p in _get_open_positions().items()
+                )
+                _append_capital(cash, val_pos, nota=f"salida {ticker} SL (reconciliado)", operacion_id=op_id)
+                _tlog.info(
+                    "[CONNORS] CIERRE    %-6s · SL (reconciliado) · PnL %+.2f€  · %dd",
+                    ticker, net, dias,
+                )
+
+            elif status in ("cancelled", "canceled", "expired", "replaced", ""):
+                # Stop cancelada externamente o no encontrada → limpiar y caer a batch.
+                with _get_connection() as con:
+                    con.execute(
+                        "UPDATE connors_operaciones SET alpaca_sl_order_id=NULL, "
+                        "updated_at=datetime('now') WHERE id=? AND estado='abierta'",
+                        (op_id,),
+                    )
+                console.print(
+                    f"[yellow]⚠ {ticker}: stop nativa {status} — se retira ID, "
+                    f"fallback a chequeo SL por precio[/yellow]"
+                )
+                _slog.warning(
+                    "_reconcile_sl_orders: stop %s %s para %s — fallback batch",
+                    sl_order_id, status, ticker,
+                )
+            # Si está activa (new, held, accepted, pending_new…) → sin acción.
+
+        else:
+            # Caso B: migración retroactiva — posición sin stop nativa, flag activo.
+            sl_price = pos.get("stop_loss_price")
+            shares   = pos.get("shares")
+            if not sl_price or not shares or not op_id:
+                continue
+            # Alpaca no admite stop-limit GTC para fracciones; solo intentar
+            # si las acciones son enteras (posiciones abiertas tras el cambio
+            # a math.floor en _abrir_posicion). Las fraccionarias caen al batch.
+            if shares != math.floor(shares):
+                _slog.debug(
+                    "_reconcile_sl_orders: %s tiene %.4f acciones fraccionarias "
+                    "— sin stop nativa, usando chequeo batch",
+                    ticker, shares,
+                )
+                continue
+            console.print(
+                f"[dim]{ticker}: sin stop nativa — intentando envío retroactivo[/dim]"
+            )
+            _send_native_sl(broker, ticker, shares, sl_price, op_id)
+
+
+def _reconcile_exits() -> int:
+    """
+    Detecta posiciones que SQLite ya marcó como 'cerrada' pero cuya orden de
+    cierre (MOC u otro) no se ejecutó en Alpaca, y las cierra con una orden de
+    mercado inmediata.
+
+    Caso típico: EXIT_MOC=True envía una orden MOC que el simulador paper de
+    Alpaca no procesa, dejando la posición abierta en el broker aunque SQLite
+    la considera cerrada. Sin esta reconciliación, esas posiciones 'fantasma'
+    bloquean capital en Alpaca y distorsionan el conteo de slots.
+
+    Returns:
+        Número de posiciones reconciliadas (forzadas a cierre en Alpaca).
+    """
+    if not getattr(config, "ALPACA_ENABLED", False):
+        return 0
+    try:
+        from modules.alpaca_broker import get_broker
+        broker = get_broker()
+        alpaca_positions = broker.get_positions()
+        if not alpaca_positions:
+            return 0
+
+        active_tickers = set(_get_open_positions()) | set(_get_pending_orders())
+        n_reconciled = 0
+
+        for p in alpaca_positions:
+            ticker = p["ticker"]
+            if ticker in active_tickers:
+                continue  # posición activa en SQLite → no tocar
+
+            # ¿Existe una fila 'cerrada' para este ticker? (el sistema intentó cerrarla)
+            with _get_connection() as con:
+                row = con.execute(
+                    "SELECT id FROM connors_operaciones "
+                    "WHERE ticker=? AND estado='cerrada' ORDER BY id DESC LIMIT 1",
+                    (ticker,),
+                ).fetchone()
+            if not row:
+                continue  # posición manual ajena al sistema → no tocar
+
+            _slog.warning(
+                "_reconcile_exits: %s cerrada en SQLite pero abierta en Alpaca "
+                "(MOC no ejecutado) → forzando cierre market",
+                ticker,
+            )
+            console.print(
+                f"[yellow]⚠ {ticker}: orden de cierre no ejecutada en Alpaca "
+                f"— forzando cierre market[/yellow]"
+            )
+            try:
+                broker.close_position(ticker)
+                n_reconciled += 1
+            except Exception as exc:
+                _slog.error("_reconcile_exits: error al cerrar %s: %s", ticker, exc)
+
+        if n_reconciled:
+            _slog.info("_reconcile_exits: %d posición(es) cerrada(s) en Alpaca", n_reconciled)
+        return n_reconciled
+    except Exception as exc:
+        _slog.warning("_reconcile_exits: no se pudo consultar Alpaca: %s", exc)
+        return 0
+
 
 def _check_pending_orders() -> dict:
     """
@@ -314,6 +629,11 @@ def _check_pending_orders() -> dict:
     """
     if not getattr(config, "ALPACA_ENABLED", False):
         return {"filled": 0, "expired": 0, "canceled": 0, "pending": 0}
+
+    # Cierra en Alpaca posiciones que SQLite ya cerró pero cuyo MOC no ejecutó.
+    _reconcile_exits()
+    # Reconcilia stops nativas antes de procesar entradas pendientes.
+    _reconcile_sl_orders()
 
     pendings = _get_pending_orders()
     if not pendings:
@@ -369,6 +689,7 @@ def _check_pending_orders() -> dict:
 # ── Descarga de datos (yfinance directo, sin data.py) ─────────────────────────
 
 _LOOKBACK_CALENDAR_DAYS = 420   # ≈ 290 días hábiles → suficiente para SMA200 + percentil
+_BACKTEST_DL_START      = "1997-01-01"   # inicio fijo para backtest → parquet reutilizable
 
 
 def _download_universe(
@@ -377,18 +698,25 @@ def _download_universe(
     tickers: list | None = None,
 ) -> tuple[dict, pd.DataFrame | None]:
     """
-    Descarga el universo dado + SPY. Si `start`/`end` son None usa la ventana
-    de sesión (hoy-420 → hoy) y aprovecha el caché. Si se pasan explícitos,
-    siempre descarga fresh con esas fechas (no usa caché). `tickers` permite
-    restringir el universo (default: load_universe()).
+    Descarga el universo dado + SPY con caché en dos niveles (sesión + disco).
+
+    - Sin start/end (modo sesión): ventana hoy-420d → hoy; reutiliza session_data.
+    - Con start/end (modo backtest): descarga desde _BACKTEST_DL_START para que el
+      parquet de disco cubra cualquier backtest futuro del mismo día sin re-descargar.
+      También reutiliza session_data si el ticker ya está cargado.
+    `tickers` restringe el universo (default: load_universe()).
     """
     # Limpiar cachés parquet de días anteriores antes de cualquier descarga
     yf_cache.cleanup_old_caches()
 
     use_session = start is None and end is None
     if use_session:
-        start = (date.today() - timedelta(days=_LOOKBACK_CALENDAR_DAYS)).strftime("%Y-%m-%d")
-        end   = date.today().strftime("%Y-%m-%d")
+        dl_start = (date.today() - timedelta(days=_LOOKBACK_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+        dl_end   = date.today().strftime("%Y-%m-%d")
+    else:
+        # Descarga siempre desde la fecha fija para que el parquet cubra cualquier rango
+        dl_start = _BACKTEST_DL_START
+        dl_end   = end or date.today().strftime("%Y-%m-%d")
 
     if tickers is None:
         from modules.data import load_universe
@@ -397,20 +725,18 @@ def _download_universe(
         tickers = list(tickers)
 
     console.print(
-        f"[dim]Período de descarga: {start} → {end}  "
+        f"[dim]Período de descarga: {dl_start} → {dl_end}  "
         f"· universo: {len(tickers)} tickers + SPY[/dim]"
     )
 
     universe = sorted(set(tickers + ["SPY"]))
 
-    if use_session:
-        pending = [
-            t for t in universe
-            if t not in yf_cache.session_data
-            or len(yf_cache.session_data[t]) < yf_cache.MIN_CACHE_ROWS
-        ]
-    else:
-        pending = universe   # no usar caché en backtest
+    # En ambos modos reutilizar session_data si el ticker ya está cargado
+    pending = [
+        t for t in universe
+        if t not in yf_cache.session_data
+        or len(yf_cache.session_data[t]) < yf_cache.MIN_CACHE_ROWS
+    ]
 
     cached_n = len(universe) - len(pending)
     if pending:
@@ -419,10 +745,10 @@ def _download_universe(
             f"· {cached_n} ya en sesión[/cyan]"
         )
         for t in pending:
-            df = yf_cache.load_ticker(t, start, end)
+            df = yf_cache.load_ticker(t, dl_start, dl_end)
             if df is None:
                 continue
-            if not use_session or len(df) >= yf_cache.MIN_CACHE_ROWS:
+            if len(df) >= yf_cache.MIN_CACHE_ROWS:
                 yf_cache.set_session(t, df)
 
     spy = yf_cache.get_session("SPY")
@@ -712,8 +1038,19 @@ def _abrir_posicion(sig: dict, cash: float, slot_size: float) -> tuple[float, bo
         _tlog.warning("[CONNORS] BLOQUEADO %-6s · capital insuficiente (cash=%.0f€ < slot=%.0f€)",
                       sig["ticker"], cash, slot_size)
         return cash, False
+    # Acciones enteras (floor) para que Alpaca admita stop-limit GTC nativas.
+    # effective_slot se recalcula con el coste real (sin fracción residual).
+    shares = math.floor(effective_slot / entry_p)
+    if shares <= 0:
+        console.print(
+            f"  [red]✗ {sig['ticker']}: precio ({entry_p:.2f}) supera el slot "
+            f"({effective_slot:.0f}€) — no se puede comprar 1 acción entera[/red]"
+        )
+        _slog.warning("apertura bloqueada %s: precio %.2f > slot %.0f€",
+                      sig["ticker"], entry_p, effective_slot)
+        return cash, False
+    effective_slot = shares * entry_p
     commis = effective_slot * config.COMMISSION
-    shares = effective_slot / entry_p
 
     # ── Flujo con Alpaca activo ──────────────────────────────────────────────
     # Cuando ALPACA_ENABLED=True la operación NO se abre todavía: primero se
@@ -879,15 +1216,17 @@ def aperturas_automaticas(
     n_open        = len(positions)
     n_pending     = len(pendings)
     n_selling     = len(pending_sells)
+    n_ghost       = _cierres_alpaca_pendientes(positions, pendings)
     cash          = _get_current_cash()
 
     slot_size    = _get_slot_size(cash, positions)
-    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling
+    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling - n_ghost
     if slots_libres <= 0:
         console.print(
             f"[yellow]No hay slots disponibles "
-            f"({n_open} abiertas + {n_pending} pendientes / "
-            f"{config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
+            f"({n_open} abiertas + {n_pending} pendientes"
+            + (f" + {n_ghost} cierre(s) Alpaca pendiente(s)" if n_ghost else "")
+            + f" / {config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
         )
         return 0
     if cash < slot_size * 0.95:
@@ -963,17 +1302,19 @@ def opcion_registrar_entrada() -> None:
     n_open        = len(positions)
     n_pending     = len(pendings)
     n_selling     = len(pending_sells)
+    n_ghost       = _cierres_alpaca_pendientes(positions, pendings)
     cash          = _get_current_cash()
 
     slot_size = _get_slot_size(cash, positions)
 
-    # ── Slots libres (descuenta posiciones abiertas Y pendientes Alpaca) ─────
-    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling
+    # ── Slots libres (descuenta abiertas, pendientes y cierres Alpaca en tránsito) ─
+    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling - n_ghost
     if slots_libres <= 0:
         console.print(
             f"[yellow]No hay slots disponibles "
-            f"({n_open} abiertas + {n_pending} pendientes / "
-            f"{config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
+            f"({n_open} abiertas + {n_pending} pendientes"
+            + (f" + {n_ghost} cierre(s) Alpaca pendiente(s)" if n_ghost else "")
+            + f" / {config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
         )
         return
     if cash < slot_size * 0.95:
@@ -1096,8 +1437,13 @@ def _scan_exit_signals(
         except Exception:
             dias = 0
 
+        # Si la posición tiene stop nativa activa en Alpaca, no comprobamos SL
+        # por precio (Alpaca lo gestiona de forma autónoma). Si alpaca_sl_order_id
+        # es NULL (envío fallido o flag desactivado), sí se comprueba en batch.
+        tiene_stop_nativa = bool(pos.get("alpaca_sl_order_id"))
+
         reason: str | None = None
-        if cur_p <= sl_p:
+        if not tiene_stop_nativa and cur_p <= sl_p:
             reason = "SL"
         elif dias >= config.CONNORS_TIME_STOP:
             reason = "TSTO"
@@ -1188,8 +1534,15 @@ def opcion_registrar_salida() -> None:
 
 def _close_position_db(
     ticker: str, pos: dict, exit_price: float, reason: str, exit_d: date,
+    allow_moc: bool = False,
 ) -> None:
-    """Cierra una posición: UPDATE de la operación a estado 'cerrada'."""
+    """Cierra una posición: UPDATE de la operación a estado 'cerrada'.
+
+    Params:
+        allow_moc: cuando True (y EXIT_MOC=True en config), envía la orden de
+            venta como MOC. Solo debe activarse desde --run exits, donde el
+            precio Alpaca es en tiempo real y se está dentro del deadline 15:50 ET.
+    """
     shares           = pos["shares"]
     entry_p          = pos["entry_price"]
     val_compra       = pos["valor_compra"]
@@ -1257,24 +1610,68 @@ def _close_position_db(
         try:
             from modules.alpaca_broker import get_broker
             broker = get_broker()
-            # SL siempre market inmediato; CRSI_EXIT/TSTO/MANUAL pueden ser MOC.
-            use_moc = getattr(config, "EXIT_MOC", False) and reason != "SL"
-            if use_moc:
-                # MOC: fill al cierre NYSE del día, igual que el backtest (Close[D]).
-                # Requiere enviar la orden antes de las 15:50 ET (3:50 PM).
-                # Alpaca no admite fracciones en MOC → truncar a entero.
-                moc_qty = int(shares)
-                if moc_qty <= 0:
-                    broker.close_position(ticker)
-                else:
-                    broker.submit_order(ticker, moc_qty, "sell", moc=True)
-                console.print(
-                    f"[cyan]📤 Orden MOC enviada para {ticker} "
-                    f"({shares:.4f} acc.) — fill al cierre[/cyan]"
-                )
+
+            # Si hay stop nativa activa: cancelarla antes de enviar el cierre.
+            # Protección contra carrera: cancelamos, luego leemos el estado
+            # definitivo — si ya estaba filled la stop se disparó sola y no
+            # enviamos segunda orden de venta (evita doble venta).
+            sl_order_id = pos.get("alpaca_sl_order_id") if pos else None
+            sl_already_filled = False
+            if sl_order_id:
+                try:
+                    broker.cancel_order(sl_order_id)
+                    final_sl = broker.get_order(sl_order_id)
+                    if final_sl.get("status") == "filled":
+                        # La stop ya se ejecutó — SQLite ya se cerró arriba
+                        # con exit_price; no enviar segunda orden a Alpaca.
+                        sl_already_filled = True
+                        _slog.info(
+                            "stop nativa ya ejecutada al cancelar %s — "
+                            "sin segunda orden Alpaca",
+                            ticker,
+                        )
+                except Exception as exc_sl:
+                    _slog.warning(
+                        "cancel/check stop nativa %s ticker=%s: %s",
+                        sl_order_id, ticker, exc_sl,
+                    )
+
+            if sl_already_filled:
+                pass  # la posición ya cerró vía stop nativa; nada más que hacer
             else:
-                broker.close_position(ticker)
-                console.print(f"[cyan]📤 Posición cerrada en Alpaca: {ticker}[/cyan]")
+                # SL siempre market inmediato; CRSI_EXIT/TSTO/MANUAL pueden ser MOC
+                # solo si el llamador lo permite (--run exits con precio real) y
+                # estamos en cuenta real (paper no procesa MOC → posiciones fantasma).
+                is_paper = getattr(config, "ALPACA_PAPER", True)
+                use_moc = (
+                    allow_moc
+                    and getattr(config, "EXIT_MOC", False)
+                    and reason != "SL"
+                    and not is_paper
+                )
+                if use_moc:
+                    # MOC: fill al cierre NYSE, igual que el backtest (Close[D]).
+                    # Alpaca no admite fracciones en MOC → enviar entero como MOC
+                    # y el resto fraccionario como market para cerrar todo.
+                    # Deadline Alpaca: 15:50 ET.
+                    moc_qty = int(shares)
+                    frac_qty = round(shares - moc_qty, 6)
+                    if moc_qty > 0:
+                        broker.submit_order(ticker, moc_qty, "sell", moc=True)
+                    if frac_qty > 0.0001:
+                        broker.submit_order(ticker, frac_qty, "sell", "market")
+                    if moc_qty <= 0:
+                        # Posición <1 acción, solo market
+                        broker.close_position(ticker)
+                    console.print(
+                        f"[cyan]📤 Orden MOC enviada para {ticker} "
+                        f"({moc_qty} acc. MOC"
+                        + (f" + {frac_qty:.4f} market" if frac_qty > 0.0001 else "")
+                        + f")[/cyan]"
+                    )
+                else:
+                    broker.close_position(ticker)
+                    console.print(f"[cyan]📤 Posición cerrada en Alpaca: {ticker}[/cyan]")
         except Exception as exc:
             console.print(f"[yellow]⚠ Alpaca: {exc}[/yellow]")
             _slog.error("close_position Alpaca %s: %s", ticker, exc, exc_info=True)
@@ -1288,6 +1685,8 @@ def run_connors_backtest(
     end_date:      str | None  = None,
     skip_download: bool        = False,
     export:        bool        = True,
+    verbose:       bool        = True,
+    collect_debug: bool        = False,
 ) -> dict:
     """
     Backtest ConnorsRSI sobre un rango histórico.
@@ -1298,6 +1697,11 @@ def run_connors_backtest(
                        UNA VEZ al inicio y reúsa los datos en 324 combinaciones).
         export:        si False, no escribe el CSV de operaciones (útil
                        cuando el sweep ejecuta múltiples backtests seguidos).
+        verbose:       si False, suprime toda la salida de consola (útil en
+                       sweep donde el resumen lo imprime la función llamante).
+        collect_debug: si True, añade al resultado _dbg_daily_pos (tickers
+                       abiertos por día), _dbg_sim_fails y _dbg_entries para
+                       verificar invariantes de slots y efecto de sustitución.
     """
     from modules.data import load_universe
     tickers    = list(tickers) if tickers is not None else load_universe()
@@ -1330,23 +1734,26 @@ def run_connors_backtest(
     spy["SMA200"] = spy["Close"].rolling(200).mean()
 
     # Precalcular indicadores
-    console.print(
-        f"[cyan]Calculando ConnorsRSI para {len(raw)} tickers...[/cyan]"
-    )
+    if verbose:
+        console.print(
+            f"[cyan]Calculando ConnorsRSI para {len(raw)} tickers...[/cyan]"
+        )
     indicators: dict = {}
     for t, df in raw.items():
         try:
             ind = compute_connors(df)
         except Exception as exc:
-            console.print(f"  [red]✗ {t}: indicador fallido — {exc}[/red]")
+            if verbose:
+                console.print(f"  [red]✗ {t}: indicador fallido — {exc}[/red]")
             continue
-        valid = int(ind["CONNORS_RSI"].notna().sum())
-        console.print(
-            f"  [dim]{t}: {len(ind)} filas · "
-            f"{valid} con CRSI válido · "
-            f"rango CRSI [{ind['CONNORS_RSI'].min():.1f}, "
-            f"{ind['CONNORS_RSI'].max():.1f}][/dim]"
-        )
+        if verbose:
+            valid = int(ind["CONNORS_RSI"].notna().sum())
+            console.print(
+                f"  [dim]{t}: {len(ind)} filas · "
+                f"{valid} con CRSI válido · "
+                f"rango CRSI [{ind['CONNORS_RSI'].min():.1f}, "
+                f"{ind['CONNORS_RSI'].max():.1f}][/dim]"
+            )
         indicators[t] = ind
 
     start_ts  = pd.Timestamp(start_date)
@@ -1369,11 +1776,12 @@ def run_connors_backtest(
     closed: list    = []
     daily_prices: dict = {}  # {ticker: [{fecha, open, close, entry_date, entry_price}]}
 
-    console.print(
-        f"[bold cyan]Backtest ConnorsRSI {start_date} → {end_date}  "
-        f"({len(all_dates)} sesiones · capital {initial_capital:.0f} € · "
-        f"{slot_size:.0f} €/slot)[/bold cyan]"
-    )
+    if verbose:
+        console.print(
+            f"[bold cyan]Backtest ConnorsRSI {start_date} → {end_date}  "
+            f"({len(all_dates)} sesiones · capital {initial_capital:.0f} € · "
+            f"{slot_size:.0f} €/slot)[/bold cyan]"
+        )
 
     # Contadores de diagnóstico
     n_market_off    = 0
@@ -1382,7 +1790,18 @@ def run_connors_backtest(
     n_exits_sl      = 0
     n_exits_tsto    = 0
     n_exits_crsi    = 0
+    n_no_fill_sim   = 0   # señales descartadas por FILL_SIM (Low[D] > limit_price)
     rejected = {"sma": 0, "crsi": 0, "low3": 0}
+
+    use_fill_sim = (
+        getattr(config, "FILL_SIM", False)
+        and not getattr(config, "FILL_AT_CLOSE", False)
+    )
+
+    # Estructuras de debug (solo se rellenan si collect_debug=True)
+    _dbg_daily_pos: dict  = {}   # {pd.Timestamp: [tickers abiertos al cierre del día]}
+    _dbg_sim_fails: list  = []   # [(fecha, ticker)] — fallo Low[D] > limit_p
+    _dbg_entries:   list  = []   # [(fecha, ticker)] — entrada confirmada
 
     for i_d, d in enumerate(all_dates):
         # ── Salidas ──────────────────────────────────────────────────────────
@@ -1508,8 +1927,28 @@ def run_connors_backtest(
             if len(positions) >= n_target:
                 break
             limit_p = c["close"] * (1.0 - config.CONNORS_ENTRY_LIMIT)
-            # FILL_AT_CLOSE=True → fill al cierre de D (MOC); si no, al límite.
-            entry_p = c["close_entry"] if config.FILL_AT_CLOSE else limit_p
+
+            # ── Precio y validez de fill ────────────────────────────────────
+            if use_fill_sim:
+                # Usa Open y Low del día de entrada D (ya descargados por yfinance)
+                ind_d = indicators.get(c["ticker"])
+                if ind_d is None or d not in ind_d.index:
+                    n_no_fill_sim += 1
+                    continue
+                row_d  = ind_d.loc[d]
+                open_d = float(row_d["Open"])
+                low_d  = float(row_d["Low"])
+                if low_d > limit_p:
+                    n_no_fill_sim += 1
+                    if collect_debug:
+                        _dbg_sim_fails.append((d, c["ticker"]))
+                    continue
+                # Gap de apertura → fill al Open (mejor precio que el límite)
+                entry_p = open_d if open_d <= limit_p else limit_p
+            elif config.FILL_AT_CLOSE:
+                entry_p = c["close_entry"]
+            else:
+                entry_p = limit_p
             # Tamaño efectivo: slot completo si hay cash; si no, recortamos a
             # lo disponible (con margen para comisión). Aceptamos sólo si la
             # apertura cubre ≥ 95 % del slot objetivo.
@@ -1524,6 +1963,8 @@ def run_connors_backtest(
             shares = effective_slot / entry_p
             cash  -= effective_slot + commis
             n_entries += 1
+            if collect_debug:
+                _dbg_entries.append((d, c["ticker"]))
             positions[c["ticker"]] = {
                 "entry_date":       d,
                 "entry_price":      entry_p,
@@ -1551,6 +1992,8 @@ def run_connors_backtest(
                 "open":        float(row_d["Open"]),
                 "close":       float(row_d["Close"]),
             })
+        if collect_debug:
+            _dbg_daily_pos[d] = list(positions.keys())
 
     # Cierre final
     final_d = all_dates[-1]
@@ -1609,6 +2052,14 @@ def run_connors_backtest(
         style="white",
     )
     diag.append(f"  Total trades cerrados      : {len(closed)}\n", style="bold white")
+    if use_fill_sim:
+        n_cand = n_entries + n_no_fill_sim
+        fill_rate = n_entries / n_cand * 100 if n_cand > 0 else 0.0
+        diag.append(
+            f"  Fill sim — no fill (Low>lím): {n_no_fill_sim}  "
+            f"(fill rate simulado {fill_rate:.1f}%)\n",
+            style="yellow",
+        )
     diag.append("\n  Rechazos en bucle de entrada (totales acumulados):\n", style="dim")
     diag.append(
         f"    · Close ≤ SMA200          : {rejected['sma']:>8}\n", style="dim",
@@ -1621,24 +2072,31 @@ def run_connors_backtest(
     diag.append(
         f"    · No es mínimo de 3 días  : {rejected['low3']:>8}\n", style="dim",
     )
-    console.print(Panel(
-        diag,
-        title="[bold cyan]Diagnóstico backtest[/bold cyan]",
-        border_style="cyan", padding=(0, 2),
-    ))
-
-    _print_backtest_report(
-        start_date, end_date, initial_capital, capital_final, closed, len(all_dates),
-    )
+    if verbose:
+        console.print(Panel(
+            diag,
+            title="[bold cyan]Diagnóstico backtest[/bold cyan]",
+            border_style="cyan", padding=(0, 2),
+        ))
+        _print_backtest_report(
+            start_date, end_date, initial_capital, capital_final, closed, len(all_dates),
+        )
     _sfx_parts = []
     if config.LOOKAHEAD_FIX:
         _sfx_parts.append("nolookahead")
     if config.FILL_AT_CLOSE:
         _sfx_parts.append("moc")
+    if use_fill_sim:
+        _sfx_parts.append("fill_sim")
     csv_suffix = ("_" + "_".join(_sfx_parts)) if _sfx_parts else ""
     csv       = _export_backtest_csv(closed, start_date, end_date, suffix=csv_suffix) if export else None
     daily_csv = _export_backtest_daily_csv(daily_prices, start_date, end_date, suffix=csv_suffix) if export else None
-    return {"trades": closed, "capital_final": capital_final, "csv": csv, "daily_csv": daily_csv}
+    result = {"trades": closed, "capital_final": capital_final, "csv": csv, "daily_csv": daily_csv}
+    if collect_debug:
+        result["_dbg_daily_pos"] = _dbg_daily_pos
+        result["_dbg_sim_fails"] = _dbg_sim_fails
+        result["_dbg_entries"]   = _dbg_entries
+    return result
 
 
 def get_capital_summary_connors() -> dict:
@@ -1840,6 +2298,151 @@ def opcion_backtest() -> None:
     run_connors_backtest(start_date=start, end_date=end_ask)
 
 
+# ── Opción I — Sweep CONNORS_ENTRY_LIMIT ─────────────────────────────────────
+
+def opcion_sweep_entry_limit() -> None:
+    """
+    Barre una lista de valores de CONNORS_ENTRY_LIMIT y muestra un resumen
+    comparativo de rentabilidad, número de trades y win rate.
+    Descarga los datos UNA SOLA VEZ y reutiliza la caché de sesión.
+    Incluye suavizado por ventana de 3 vecinos para distinguir mesetas reales
+    de picos de muestra pequeña.
+    """
+    end_default  = config.DEFAULT_END_DATE or date.today().strftime("%Y-%m-%d")
+    start = Prompt.ask("  Fecha inicio", default=config.DEFAULT_START_DATE).strip()
+    end   = Prompt.ask("  Fecha fin",    default=end_default).strip()
+    _vals_default = "0.005,0.008,0.010,0.011,0.012,0.013,0.014,0.016,0.017,0.018,0.020"
+    valores_str = Prompt.ask(
+        "  Valores ENTRY_LIMIT separados por coma",
+        default=_vals_default,
+    ).strip()
+    try:
+        datetime.strptime(start, "%Y-%m-%d")
+        datetime.strptime(end, "%Y-%m-%d")
+        valores = [float(v.strip()) for v in valores_str.split(",") if v.strip()]
+    except ValueError as exc:
+        console.print(f"[red]Entrada inválida: {exc}[/red]")
+        return
+    if not valores:
+        console.print("[red]Sin valores para barrer.[/red]")
+        return
+
+    original    = config.CONNORS_ENTRY_LIMIT
+    resultados  = []
+
+    fill_sim_on = getattr(config, "FILL_SIM", False) and not getattr(config, "FILL_AT_CLOSE", False)
+    console.print(
+        f"\n[bold cyan]Sweep CONNORS_ENTRY_LIMIT · {len(valores)} valores · "
+        f"{start} → {end}[/bold cyan]"
+        + (f"  [yellow][FILL_SIM activo][/yellow]" if fill_sim_on else "")
+    )
+
+    for i, val in enumerate(valores):
+        config.CONNORS_ENTRY_LIMIT = val
+        console.print(f"  [dim]── {val:.3f}[/dim] ", end="")
+        resultado = run_connors_backtest(
+            start_date=start,
+            end_date=end,
+            skip_download=(i > 0),
+            export=False,
+            verbose=False,
+        )
+        cap_i    = config.CONNORS_CAPITAL
+        cap_f    = resultado.get("capital_final", cap_i)
+        trades   = resultado.get("trades", [])
+        n_trades = len(trades)
+        pnl_pct  = (cap_f - cap_i) / cap_i * 100
+        n_win    = sum(1 for t in trades if (t.get("net_pnl") or 0) > 0)
+        win_rate = n_win / n_trades * 100 if n_trades > 0 else 0.0
+        resultados.append((val, pnl_pct, n_trades, win_rate, cap_f))
+        color = "green" if pnl_pct >= 0 else "red"
+        console.print(
+            f"[{color}]{pnl_pct:+.1f}%[/{color}]  "
+            f"{n_trades} trades  {win_rate:.0f}% win"
+        )
+
+    config.CONNORS_ENTRY_LIMIT = original
+
+    # ── Suavizado de 3 vecinos ────────────────────────────────────────────────
+    pnl_vals = [r[1] for r in resultados]
+    smooth   = []
+    for i in range(len(pnl_vals)):
+        lo  = max(0, i - 1)
+        hi  = min(len(pnl_vals), i + 2)
+        nbrs = pnl_vals[lo:hi]
+        smooth.append(sum(nbrs) / len(nbrs))
+
+    # ── Tabla comparativa con columna suavizada ────────────────────────────────
+    best_smooth_idx = smooth.index(max(smooth))
+    table = Table(
+        title=f"[bold cyan]Sweep CONNORS_ENTRY_LIMIT · {start} → {end}[/bold cyan]",
+        box=box.ROUNDED, border_style="cyan",
+    )
+    table.add_column("ENTRY_LIMIT",  justify="center", style="bold")
+    table.add_column("Rentab.",      justify="right")
+    table.add_column("Suavizada*",   justify="right")
+    table.add_column("Cap. final €", justify="right")
+    table.add_column("Trades",       justify="right")
+    table.add_column("Win Rate",     justify="right")
+    for i, (val, pnl, n, wr, cap_f) in enumerate(resultados):
+        color  = "green" if pnl >= 0 else "red"
+        sc     = smooth[i]
+        sc_col = "green" if sc >= 0 else "red"
+        marker = " ◄" if i == best_smooth_idx else ""
+        table.add_row(
+            f"{val:.3f}{marker}",
+            f"[{color}]{pnl:+.1f}%[/{color}]",
+            f"[{sc_col}]{sc:+.1f}%[/{sc_col}]",
+            f"{cap_f:,.0f}",
+            str(n),
+            f"{wr:.0f}%",
+        )
+    console.print()
+    console.print(table)
+    console.print("[dim]  * Suavizada = media de rentabilidad entre el valor y sus vecinos inmediatos.[/dim]")
+
+    # ── Listado compacto ───────────────────────────────────────────────────────
+    console.print()
+    for i, (val, pnl, n, wr, _) in enumerate(resultados):
+        color = "green" if pnl >= 0 else "red"
+        console.print(
+            f"  CONNORS_ENTRY_LIMIT([bold cyan]{val:.3f}[/bold cyan]) = "
+            f"[{color}]{pnl:+.1f}%[/{color}]"
+        )
+
+    # ── Diagnóstico de robustez ────────────────────────────────────────────────
+    console.print()
+    best_raw_idx  = pnl_vals.index(max(pnl_vals))
+    best_raw_val  = resultados[best_raw_idx][0]
+    best_smooth_val = resultados[best_smooth_idx][0]
+
+    # Meseta: cuántos valores tienen suavizada >= 80% del pico suavizado
+    peak_smooth = smooth[best_smooth_idx]
+    meseta = [resultados[j][0] for j in range(len(smooth)) if smooth[j] >= peak_smooth * 0.80]
+
+    delta_raw_smooth = abs(pnl_vals[best_raw_idx] - smooth[best_raw_idx])
+
+    console.print(Panel(
+        Text.from_markup(
+            f"  Pico bruto     : ENTRY_LIMIT={best_raw_val:.3f}  "
+            f"({pnl_vals[best_raw_idx]:+.1f}% · {resultados[best_raw_idx][2]} trades)\n"
+            f"  Pico suavizado : ENTRY_LIMIT={best_smooth_val:.3f}  "
+            f"({smooth[best_smooth_idx]:+.1f}% media 3 vecinos)\n"
+            f"  Meseta ≥80% del pico suavizado: {[f'{v:.3f}' for v in meseta]}\n\n"
+            + (
+                f"  [yellow]⚠ El pico bruto ({best_raw_val:.3f}) dista {delta_raw_smooth:.1f}pp "
+                f"de su suavizado — probable ruido de muestra pequeña.\n"
+                f"  No recomendado como valor óptimo hasta ampliar el período de backtest.[/yellow]"
+                if delta_raw_smooth > 4.0 else
+                f"  [green]✓ Pico y suavizado alineados (diferencia {delta_raw_smooth:.1f}pp) "
+                f"— señal relativamente robusta.[/green]"
+            )
+        ),
+        title="[bold cyan]Diagnóstico de robustez[/bold cyan]",
+        border_style="cyan", padding=(0, 2),
+    ))
+
+
 # ── Opción F — Historial ─────────────────────────────────────────────────────
 
 def opcion_historial() -> None:
@@ -1967,6 +2570,7 @@ _OPTIONS = {
     "F": ("Ver historial de operaciones",        opcion_historial),
     "G": ("Ver resumen de rentabilidad",         opcion_resumen),
     "H": ("Exportar a CSV",                      opcion_exportar_csv),
+    "I": ("Sweep CONNORS_ENTRY_LIMIT",           opcion_sweep_entry_limit),
 }
 
 

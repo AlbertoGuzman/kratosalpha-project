@@ -55,7 +55,7 @@ CONNORS_STREAK_PERIOD = 2        # RSI del streak
 CONNORS_RANK_PERIOD   = 100      # períodos para percentil
 CONNORS_ENTRY_CRSI    = 25       # umbral de entrada (CRSI < 25)
 CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
-CONNORS_STOP_LOSS     = 0.05     # 5 %
+CONNORS_STOP_LOSS     = 0.02     # 5 %
 CONNORS_TIME_STOP     = 5        # días máximos abierta
 CONNORS_ENTRY_LIMIT   = 0.01     # descuento sobre Close[D-1] para la orden limit
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia
@@ -84,12 +84,34 @@ LOOKAHEAD_FIX = True
 # para que la combinación sea realista (señal D-1, fill al cierre de D).
 FILL_AT_CLOSE = False
 
+# Cuando True, el backtest simula el fill de cada orden limit usando Open y Low
+# del día de entrada D (solo para análisis; no afecta al trading en vivo con Alpaca).
+#   · Low[D] > limit_price → no fill  · Open[D] <= limit_price → fill al Open
+# Solo aplica con FILL_AT_CLOSE=False y LOOKAHEAD_FIX=True.
+FILL_SIM = True
+
 # Cuando True, los cierres de posición en Alpaca se envían como órdenes MOC
 # (Market on Close, TimeInForce.CLS) en lugar de órdenes de mercado inmediatas.
 # El fill ocurre al cierre de NYSE ese día, igual que en el backtest (Close[D]).
 # Usar junto con LOOKAHEAD_FIX=True: autopiloto a las 15:30 → señales D-1,
 # entradas limit y salidas MOC → operativa coherente con el backtest.
 EXIT_MOC = True
+
+# Cuando True, al materializarse una entrada se envía inmediatamente a Alpaca
+# una stop-limit GTC de venta al nivel stop_loss_price. Alpaca la ejecuta de
+# forma autónoma sin depender del pase batch de las 15:30.
+# Requiere ALPACA_ENABLED=True. Dejar a False hasta validar en paper trading
+# (comparar PnL medio SL real vs teórico -175,53 € y pre-cambio -221,23 €).
+# Posiciones sin alpaca_sl_order_id (flag era False al abrirlas) siguen usando
+# el chequeo por precio como fallback aunque este flag esté activo.
+ALPACA_NATIVE_SL = False
+
+# Margen aplicado al stop_price para calcular el limit_price de la stop-limit.
+# limit_price = stop_price × (1 - ALPACA_NATIVE_SL_LIMIT_MARGIN).
+# 0.005 = 0,5 % → ejecuta en caídas normales; protege contra ejecución muy
+# alejada del nivel en gaps extremos. Si el gap supera el margen, la orden
+# no se ejecuta (riesgo de no-fill consciente vs riesgo de slippage extremo).
+ALPACA_NATIVE_SL_LIMIT_MARGIN = 0.005
 
 # ── Alpaca Markets ────────────────────────────────────────────────────────────
 # Integración con Alpaca para enviar órdenes simuladas o reales. SQLite sigue

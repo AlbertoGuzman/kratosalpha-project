@@ -65,6 +65,7 @@ from modules.connors_rsi import (
     opcion_historial            as cr_historial,
     opcion_resumen              as cr_resumen,
     opcion_exportar_csv         as cr_exportar,
+    opcion_sweep_entry_limit    as cr_sweep,
 )
 
 # Para el autopiloto necesitamos acceso directo a los helpers privados del
@@ -91,6 +92,7 @@ def _opcion_connors_submenu() -> None:
         "F": ("Ver historial de operaciones",  cr_historial),
         "G": ("Ver resumen de rentabilidad",   cr_resumen),
         "H": ("Exportar a CSV",                cr_exportar),
+        "I": ("Sweep CONNORS_ENTRY_LIMIT",     cr_sweep),
     }
     while True:
         console.print("\n[bold cyan]ConnorsRSI — Mean Reversion[/bold cyan]")
@@ -614,6 +616,7 @@ def _autopiloto_cerrar_connors_automatico(
             cr._close_position_db(
                 e["ticker"], e["pos"], e["cur_p"],
                 e["reason"], date.today(),
+                allow_moc=usar_precio_alpaca,
             )
             n_cerradas += 1
         except Exception as exc:

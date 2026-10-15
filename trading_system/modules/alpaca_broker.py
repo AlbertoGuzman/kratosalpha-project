@@ -262,6 +262,54 @@ class AlpacaBroker:
         )
         return result
 
+    def submit_stop_order(
+        self,
+        ticker: str,
+        qty: float,
+        stop_price: float,
+        limit_margin: float = 0.005,
+    ) -> dict:
+        """
+        Envía una stop-limit GTC de venta a Alpaca.
+
+        Params:
+            ticker:       símbolo (e.g. "AAPL").
+            qty:          número de acciones ejecutadas (fill real, no teórico).
+            stop_price:   precio de activación (nivel SL calculado en entrada).
+            limit_margin: margen bajo el stop_price para el limit (default 0,5 %).
+                          limit_price = round(stop_price × (1 - limit_margin), 2).
+                          Evita ejecución a precios alejados en gaps extremos; si el
+                          gap supera el margen la orden no se ejecuta (no-fill
+                          consciente vs slippage extremo).
+
+        Returns:
+            dict con `order_id`, `status`, `filled_avg_price`.
+        """
+        from alpaca.trading.requests import StopLimitOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+
+        stop_p  = round(stop_price, 2)
+        limit_p = round(stop_price * (1.0 - limit_margin), 2)
+        req = StopLimitOrderRequest(
+            symbol=ticker,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=stop_p,
+            limit_price=limit_p,
+        )
+        order = self.trading_client.submit_order(order_data=req)
+        result = {
+            "order_id":         str(order.id),
+            "status":           str(order.status).lower().split(".")[-1],
+            "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else 0.0,
+        }
+        _slog.info(
+            "submit_stop_order: %s  qty=%.4f  stop=%.2f  limit=%.2f  order_id=%s",
+            ticker, qty, stop_p, limit_p, result["order_id"],
+        )
+        return result
+
     def get_order(self, order_id: str) -> dict:
         """
         Consulta el estado de una orden por id. Devuelve un dict homogéneo con
