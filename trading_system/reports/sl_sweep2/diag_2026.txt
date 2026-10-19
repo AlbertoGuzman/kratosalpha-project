@@ -1,0 +1,16 @@
+
+  2026 (ene–hoy)
+    Ops=205  WR=52.7%  avg_ret=+0.002%  MDD=31.8%
+    Net PnL=-2030€ (-20.3%)
+    Reasons: {'CRSI_EXIT': 132, 'TSTO': 29, 'SL': 42, 'END': 2}
+    Returns p5=-5.00%  p25=-2.87%  p50=0.43%  p95=5.68%
+    Días medio=2.9  n_TSTO(ratio)=14.1%
+
+  2023-2025 (referencia)
+    Ops=932  WR=59.8%  avg_ret=+0.500%  MDD=15.7%
+    Net PnL=+6166€ (+61.7%)
+    Reasons: {'CRSI_EXIT': 676, 'TSTO': 162, 'SL': 91, 'END': 3}
+    Returns p5=-5.00%  p25=-1.00%  p50=0.93%  p95=4.65%
+    Días medio=3.0  n_TSTO(ratio)=17.4%
+
+  SPY 2026: ret=+12.6%  vol_anual=13.0%

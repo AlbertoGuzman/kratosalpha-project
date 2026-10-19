@@ -37,7 +37,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 UNIVERSE_FILE = "data/sp500_universe.csv"
 
 # ── Simulación ───────────────────────────────────────────────────────────────
-COMMISSION = 0.0015           # 0.15 % por operación
+COMMISSION = 0.0           # 0.15 % por operación
 
 # Capital "de juego" real con el que operamos, usado como base fija para el
 # PnL% global del panel de capital. Aunque la cuenta Alpaca tenga más fondos
@@ -55,7 +55,7 @@ CONNORS_STREAK_PERIOD = 2        # RSI del streak
 CONNORS_RANK_PERIOD   = 100      # períodos para percentil
 CONNORS_ENTRY_CRSI    = 25       # umbral de entrada (CRSI < 25)
 CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
-CONNORS_STOP_LOSS     = 0.02     # 5 %
+CONNORS_STOP_LOSS     = 0.5    # 5 %
 CONNORS_TIME_STOP     = 5        # días máximos abierta
 CONNORS_ENTRY_LIMIT   = 0.01     # descuento sobre Close[D-1] para la orden limit
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia

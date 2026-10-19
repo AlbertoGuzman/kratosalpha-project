@@ -1680,29 +1680,33 @@ def _close_position_db(
 # ── Opción E — Backtest ───────────────────────────────────────────────────────
 
 def run_connors_backtest(
-    tickers:       list | None = None,
-    start_date:    str | None  = None,
-    end_date:      str | None  = None,
-    skip_download: bool        = False,
-    export:        bool        = True,
-    verbose:       bool        = True,
-    collect_debug: bool        = False,
+    tickers:         list | None   = None,
+    start_date:      str | None    = None,
+    end_date:        str | None    = None,
+    skip_download:   bool          = False,
+    export:          bool          = True,
+    verbose:         bool          = True,
+    collect_debug:   bool          = False,
+    fixed_slot:      bool          = False,
+    sl_slip:         float         = 0.0,
+    stop_loss_pct:   float | None  = ...,   # ... = usar config.CONNORS_STOP_LOSS
 ) -> dict:
     """
     Backtest ConnorsRSI sobre un rango histórico.
 
     Params:
-        skip_download: si True, reutiliza el contenido actual de
-                       `yf_cache.session_data` (útil para el sweep que descarga
-                       UNA VEZ al inicio y reúsa los datos en 324 combinaciones).
-        export:        si False, no escribe el CSV de operaciones (útil
-                       cuando el sweep ejecuta múltiples backtests seguidos).
-        verbose:       si False, suprime toda la salida de consola (útil en
-                       sweep donde el resumen lo imprime la función llamante).
-        collect_debug: si True, añade al resultado _dbg_daily_pos (tickers
-                       abiertos por día), _dbg_sim_fails y _dbg_entries para
-                       verificar invariantes de slots y efecto de sustitución.
+        skip_download:  si True, reutiliza yf_cache.session_data (útil en sweeps).
+        export:         si False, no escribe el CSV de operaciones.
+        verbose:        si False, suprime toda la salida de consola.
+        collect_debug:  si True, añade _dbg_daily_pos/_dbg_sim_fails/_dbg_entries.
+        fixed_slot:     si True, usa el slot inicial fijo sin compound (para análisis).
+        sl_slip:        slippage adicional en salidas SL (0.01 = 1 % extra de pérdida).
+        stop_loss_pct:  sobreescribe config.CONNORS_STOP_LOSS; None = sin stop.
+                        El valor por defecto (...) usa config.CONNORS_STOP_LOSS.
     """
+    _sl_pct: float | None = (
+        config.CONNORS_STOP_LOSS if stop_loss_pct is ... else stop_loss_pct
+    )
     from modules.data import load_universe
     tickers    = list(tickers) if tickers is not None else load_universe()
     start_date = start_date or config.DEFAULT_START_DATE
@@ -1769,18 +1773,22 @@ def run_connors_backtest(
 
     initial_capital = config.CONNORS_CAPITAL
     n_target        = config.CONNORS_MAX_POS
-    # Reserva del 0.5 % para comisiones (ver `opcion_registrar_entrada`)
-    slot_size       = (initial_capital * 0.995) / n_target
+    slot_minimo     = (initial_capital * 0.995) / n_target
+    slot_size       = slot_minimo
     cash            = initial_capital
     positions: dict = {}
     closed: list    = []
     daily_prices: dict = {}  # {ticker: [{fecha, open, close, entry_date, entry_price}]}
 
     if verbose:
+        _sl_desc = f"{_sl_pct*100:.1f}%" if _sl_pct else "sin stop"
+        _slot_desc = "fijo" if fixed_slot else "dinámico"
         console.print(
             f"[bold cyan]Backtest ConnorsRSI {start_date} → {end_date}  "
             f"({len(all_dates)} sesiones · capital {initial_capital:.0f} € · "
-            f"{slot_size:.0f} €/slot)[/bold cyan]"
+            f"slot {slot_minimo:.0f} € {_slot_desc} · SL={_sl_desc}"
+            + (f" slip={sl_slip*100:.1f}%" if sl_slip else "")
+            + ")[/bold cyan]"
         )
 
     # Contadores de diagnóstico
@@ -1812,14 +1820,29 @@ def run_connors_backtest(
                 continue
             row     = ind.loc[d]
             close   = float(row["Close"])
+            open_d  = float(row["Open"])
+            low_d   = float(row["Low"])
             crsi    = row["CONNORS_RSI"]
             days    = (d - pos["entry_date"]).days
 
             reason: str | None = None
             exit_p             = close
-            if close <= pos["stop_loss_price"]:
+            # No evaluar el stop el mismo día de la entrada: con barras diarias
+            # es imposible saber si el Low ocurrió antes o después del fill
+            # de la orden límite.
+            #
+            # Activación por Low (no Close): un stop real se activa en cuanto
+            # el precio toca el nivel durante la sesión, aunque el cierre
+            # acabe por encima. Usar Close infraestima los stops en estrategias
+            # de mean-reversion donde son frecuentes los rebotes intradiarios.
+            if days > 0 and _sl_pct and low_d <= pos["stop_loss_price"]:
                 reason = "SL"
-                exit_p = pos["stop_loss_price"]
+                # Precio de ejecución:
+                #   · gap bajista (Open <= stop): fill al Open
+                #   · sin gap (Open > stop):      fill al nivel del stop
+                # sl_slip: haircut adicional para modelar slippage real en stops
+                raw_sl  = min(open_d, pos["stop_loss_price"])
+                exit_p  = raw_sl * (1.0 - sl_slip)
             elif not pd.isna(crsi) and float(crsi) > config.CONNORS_EXIT_CRSI:
                 reason = "CRSI_EXIT"
             elif days >= config.CONNORS_TIME_STOP:
@@ -1881,6 +1904,11 @@ def run_connors_backtest(
             continue
         if len(positions) >= n_target:
             continue
+
+        # ── Tamaño del slot ───────────────────────────────────────────────────
+        if not fixed_slot:
+            valor_posiciones = sum(p["valor_compra"] for p in positions.values())
+            slot_size = max((cash + valor_posiciones) * 0.995 / n_target, slot_minimo)
 
         # ── Entradas ─────────────────────────────────────────────────────────
         candidates = []
@@ -1972,7 +2000,7 @@ def run_connors_backtest(
                 "shares":           shares,
                 "valor_compra":     effective_slot,
                 "commission_entry": commis,
-                "stop_loss_price":  entry_p * (1.0 - config.CONNORS_STOP_LOSS),
+                "stop_loss_price":  entry_p * (1.0 - _sl_pct) if _sl_pct else 0.0,
                 "connors_rsi_entrada": c["crsi"],
                 "rsi3_entrada":     c["rsi3"],
                 "streak_entrada":   c["streak"],
