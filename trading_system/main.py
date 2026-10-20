@@ -1046,6 +1046,8 @@ def _print_menu() -> None:
     menu.append(". Ver logs\n", style="white")
     menu.append("  7", style="bold cyan")
     menu.append(". Estado Alpaca\n", style="white")
+    menu.append("  8", style="bold cyan")
+    menu.append(". Análisis Stop Loss dinámico\n", style="white")
     menu.append("  0", style="bold red")
     menu.append(". Salir\n", style="white")
 
@@ -1061,6 +1063,21 @@ def _print_menu() -> None:
     )
 
 
+def _opcion_sl_dinamico() -> None:
+    """Opción 8 — Análisis de Stop Loss dinámico sobre el último CSV de backtest."""
+    import importlib.util, pathlib
+    script = pathlib.Path(__file__).parent / "analisis_sl_dinamico.py"
+    spec = importlib.util.spec_from_file_location("analisis_sl_dinamico", script)
+    mod  = importlib.util.module_from_spec(spec)
+    # Evitar que argparse interprete los args de main.py
+    import sys as _sys
+    _argv_orig, _sys.argv = _sys.argv, [str(script)]
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        _sys.argv = _argv_orig
+
+
 _OPTIONS = {
     "1": _opcion_autopiloto,
     "2": _opcion_connors_submenu,
@@ -1069,6 +1086,7 @@ _OPTIONS = {
     "5": _opcion_validar_universo,
     "6": _opcion_ver_logs,
     "7": _opcion_alpaca_estado,
+    "8": _opcion_sl_dinamico,
 }
 
 

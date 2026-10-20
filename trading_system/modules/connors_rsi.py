@@ -849,7 +849,8 @@ def _scan_entry_signals(
         return []
     spy_close = float(spy_with.loc[target, "Close"])
     spy_sma   = spy_with.loc[target, "SMA200"]
-    if pd.isna(spy_sma) or spy_close < float(spy_sma):
+    _margin = getattr(config, "SPY_SMA_MARGIN", 0.0)
+    if pd.isna(spy_sma) or spy_close < float(spy_sma) * (1.0 + _margin):
         return []
 
     signals = []
@@ -1898,7 +1899,8 @@ def run_connors_backtest(
             continue
         spy_close = float(spy.loc[d_sig, "Close"])
         spy_sma   = spy.loc[d_sig, "SMA200"]
-        market_ok = (not pd.isna(spy_sma)) and (spy_close >= float(spy_sma))
+        _spy_margin = getattr(config, "SPY_SMA_MARGIN", 0.0)
+        market_ok   = (not pd.isna(spy_sma)) and (spy_close >= float(spy_sma) * (1.0 + _spy_margin))
         if not market_ok:
             n_market_off += 1
             continue
@@ -2068,7 +2070,9 @@ def run_connors_backtest(
     console.print()
     diag = Text()
     diag.append(f"  Sesiones procesadas        : {len(all_dates)}\n", style="white")
-    diag.append(f"  Sesiones con mercado bajista (SPY<SMA200): {n_market_off}\n", style="white")
+    _m = getattr(config, "SPY_SMA_MARGIN", 0.0)
+    _m_label = f"SPY<SMA200×{1+_m:.2f}" if _m else "SPY<SMA200"
+    diag.append(f"  Sesiones bloqueadas por filtro mercado ({_m_label}): {n_market_off}\n", style="white")
     diag.append(
         f"  Señales generadas (suma)   : {n_signals_total}\n", style="white"
     )

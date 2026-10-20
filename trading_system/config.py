@@ -55,8 +55,8 @@ CONNORS_STREAK_PERIOD = 2        # RSI del streak
 CONNORS_RANK_PERIOD   = 100      # períodos para percentil
 CONNORS_ENTRY_CRSI    = 25       # umbral de entrada (CRSI < 25)
 CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
-CONNORS_STOP_LOSS     = 0.5    # 5 %
-CONNORS_TIME_STOP     = 5        # días máximos abierta
+CONNORS_STOP_LOSS     = 0.5   # 5 %
+CONNORS_TIME_STOP     = 4        # días máximos abierta
 CONNORS_ENTRY_LIMIT   = 0.01     # descuento sobre Close[D-1] para la orden limit
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia
 CONNORS_MAX_POS       = 3        # posiciones simultáneas
@@ -89,6 +89,12 @@ FILL_AT_CLOSE = False
 #   · Low[D] > limit_price → no fill  · Open[D] <= limit_price → fill al Open
 # Solo aplica con FILL_AT_CLOSE=False y LOOKAHEAD_FIX=True.
 FILL_SIM = True
+
+# Margen mínimo que debe tener SPY sobre su SMA200 para habilitar entradas.
+# 0.0 = filtro binario clásico (SPY >= SMA200).
+# 0.01 = SPY debe estar al menos 1 % por encima de SMA200.
+# El análisis OOS 2020-2026 mostró WR=55 % cuando SPY está en la franja 0-1 %.
+SPY_SMA_MARGIN = 0.0
 
 # Cuando True, los cierres de posición en Alpaca se envían como órdenes MOC
 # (Market on Close, TimeInForce.CLS) en lugar de órdenes de mercado inmediatas.
