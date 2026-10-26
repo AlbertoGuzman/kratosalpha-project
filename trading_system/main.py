@@ -950,6 +950,143 @@ def _autopiloto_informe(
 
 # ── Modo desatendido (--run) ──────────────────────────────────────────────────
 
+def _run_exits_real_time() -> int:
+    """
+    Lógica de --run exits: evalúa señales de salida con precio vivo de Alpaca
+    y envía órdenes de venta a mercado (market+day, nunca MOC).
+
+    Requisitos:
+        - Mercado abierto (Alpaca clock).
+        - Sin orden sell ya activa en Alpaca para el ticker (evita duplicados).
+        - Respeta DRY_RUN: loguea intención pero no envía la orden.
+        - Error en un ticker → loguea y continúa con el siguiente.
+
+    Returns:
+        Número de posiciones vendidas (0 si mercado cerrado o nada que hacer).
+    """
+    _slog = get_system_logger()
+    _tlog = get_trading_logger()
+
+    if not getattr(config, "ALPACA_ENABLED", False):
+        _slog.info("--run exits: Alpaca deshabilitado — nada que hacer")
+        return 0
+
+    # ── 1. Verificar que el mercado esté abierto ─────────────────────────────
+    try:
+        from modules.alpaca_broker import get_broker
+        broker = get_broker()
+    except Exception as exc:
+        _slog.error("--run exits: no se pudo conectar con Alpaca: %s", exc)
+        console.print(f"[red]✗ --run exits: error Alpaca: {exc}[/red]")
+        return 0
+
+    if not broker.is_market_open():
+        _slog.info("--run exits: mercado cerrado — ejecución omitida")
+        console.print("[yellow]Mercado cerrado — --run exits no opera[/yellow]")
+        return 0
+
+    # ── 2. Posiciones abiertas en SQLite ─────────────────────────────────────
+    positions = cr._get_open_positions()
+    if not positions:
+        _tlog.info("--run exits: 0 posiciones abiertas")
+        return 0
+
+    # ── 3. Precios vivos y órdenes abiertas (una sola llamada por tipo) ──────
+    try:
+        alpaca_pos = broker.get_positions()
+        precios_alpaca = {
+            p["symbol"]: float(p["current_price"])
+            for p in alpaca_pos
+            if p.get("current_price")
+        }
+    except Exception as exc:
+        _slog.error("--run exits: error obteniendo precios Alpaca: %s", exc)
+        console.print(f"[red]✗ --run exits: error precios: {exc}[/red]")
+        return 0
+
+    try:
+        open_orders = broker.get_orders(status="open")
+        tickers_con_sell = {
+            o["ticker"] for o in open_orders if o.get("side") == "sell"
+        }
+    except Exception as exc:
+        _slog.warning("--run exits: no se pudieron obtener órdenes abiertas: %s", exc)
+        tickers_con_sell = set()
+
+    # ── 4. Datos históricos (solo tickers en cartera, sin esperar cierre yf) ─
+    from modules import yf_cache
+    if not yf_cache.session_data:
+        cr._download_universe(tickers=list(positions.keys()))
+
+    # ── 5. Evaluar señales de salida ─────────────────────────────────────────
+    exits = cr._scan_exit_signals(positions, precios_alpaca=precios_alpaca)
+    exit_map = {e["ticker"]: e for e in exits if e.get("reason")}
+
+    dry_run   = getattr(config, "DRY_RUN", False)
+    n_vendidas = n_mantenidas = n_errores = 0
+
+    for ticker, pos in positions.items():
+        precio = precios_alpaca.get(ticker, 0.0)
+        exit_e = exit_map.get(ticker)
+        reason = exit_e["reason"] if exit_e else None
+
+        try:
+            if not reason:
+                _slog.info(
+                    "exits ticker=%-6s precio=%.2f decision=MANTENER", ticker, precio
+                )
+                console.print(f"  {ticker} @ ${precio:.2f} → MANTENER")
+                n_mantenidas += 1
+                continue
+
+            # ── Verificar orden sell duplicada ────────────────────────────
+            if ticker in tickers_con_sell:
+                _slog.warning(
+                    "exits ticker=%-6s orden sell ya activa — omitiendo", ticker
+                )
+                console.print(
+                    f"  [yellow]{ticker}[/yellow] → orden sell ya activa, omitiendo"
+                )
+                n_mantenidas += 1
+                continue
+
+            _slog.info(
+                "exits ticker=%-6s precio=%.2f reason=%-10s decision=VENDER",
+                ticker, precio, reason,
+            )
+            console.print(
+                f"  [cyan]{ticker}[/cyan] @ ${precio:.2f} → VENDER ({reason})"
+            )
+
+            if dry_run:
+                _slog.info("exits DRY_RUN activo — orden omitida para %s", ticker)
+                console.print(f"  [dim][DRY_RUN] Orden omitida para {ticker}[/dim]")
+                n_vendidas += 1
+                continue
+
+            # allow_moc=False → siempre market+day (sin MOC, en paper y real)
+            cr._close_position_db(
+                ticker, pos, exit_e["cur_p"], reason, date.today(),
+                allow_moc=False,
+            )
+            n_vendidas += 1
+
+        except Exception as exc:
+            _slog.error("exits error en %s: %s", ticker, exc, exc_info=True)
+            console.print(f"  [red]✗ Error en {ticker}: {exc}[/red]")
+            n_errores += 1
+
+    # ── 6. Resumen ────────────────────────────────────────────────────────────
+    n_revisadas = len(positions)
+    resumen = (
+        f"--run exits: {n_revisadas} revisadas · "
+        f"{n_vendidas} vendidas · {n_mantenidas} mantenidas · {n_errores} errores"
+    )
+    _tlog.info(resumen)
+    console.print(f"[bold]{resumen}[/bold]")
+    return n_vendidas
+
+
 def _run_headless(mode: str) -> int:
     """
     Ejecuta el sistema sin menú interactivo. Diseñado para cron / CI.
@@ -1005,18 +1142,10 @@ def _run_headless(mode: str) -> int:
                 cr.aperturas_automaticas(reconciliar_primero=False, confirmar=False)
 
         elif mode == "exits":
-            # Modo salidas con precio real: lanzar ~21:30 local (15:30 ET),
-            # 20 min antes del deadline MOC (15:50 ET).
-            # Obtiene current_price de Alpaca → calcula CRSI[D] real →
-            # si CRSI[D] > 60, envía MOC → fill al Close[D].
-            # Esto replica exactamente el comportamiento del backtest sin
-            # depender de yfinance intradía (que es inconsistente).
+            # Precio vivo de Alpaca → market+day (nunca MOC).
+            # Lanzar ~21:45 local (15:45 ET), dentro del horario de mercado.
             yf_cache.set_skip_close_wait(True)
-            n = _autopiloto_cerrar_connors_automatico(usar_precio_alpaca=True)
-            _tlog.info(
-                "headless --run exits: %d salida(s) con precio Alpaca tiempo real",
-                n,
-            )
+            _run_exits_real_time()
 
         _tlog.info("headless --run %s completado OK", mode)
         return 0

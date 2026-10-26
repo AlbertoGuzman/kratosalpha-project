@@ -57,7 +57,12 @@ CONNORS_ENTRY_CRSI    = 25       # umbral de entrada (CRSI < 25)
 CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
 CONNORS_STOP_LOSS     = 0.5   # 5 %
 CONNORS_TIME_STOP     = 4        # días máximos abierta
-CONNORS_ENTRY_LIMIT   = 0.01     # descuento sobre Close[D-1] para la orden limit
+CONNORS_ENTRY_LIMIT   = -0.015   # descuento sobre Close[D-1] para la orden limit
+
+# Cuando True, ignora CONNORS_ENTRY_LIMIT y compra todos los candidatos al
+# precio de apertura del día de entrada (Open[D]). Fill rate 100 %, sin orden
+# límite. En real enviaría una orden a mercado en lugar de limit.
+ENTRY_AT_OPEN         = True
 CONNORS_CAPITAL       = 10000.0  # capital total dedicado a la estrategia
 CONNORS_MAX_POS       = 3        # posiciones simultáneas
 
@@ -90,6 +95,12 @@ FILL_AT_CLOSE = False
 # Solo aplica con FILL_AT_CLOSE=False y LOOKAHEAD_FIX=True.
 FILL_SIM = True
 
+# Modo "backtest como real": ignora ENTRY_AT_OPEN, activa FILL_SIM y limita
+# los candidatos a los N slots disponibles. Replica exactamente el comportamiento
+# de aperturas_automaticas: solo los N mejores candidatos reciben orden, y cada
+# una se ejecuta solo si Low[D] <= Close[D-1] × (1 - CONNORS_ENTRY_LIMIT).
+REAL_FILL_SIM = True
+
 # Margen mínimo que debe tener SPY sobre su SMA200 para habilitar entradas.
 # 0.0 = filtro binario clásico (SPY >= SMA200).
 # 0.01 = SPY debe estar al menos 1 % por encima de SMA200.
@@ -102,6 +113,10 @@ SPY_SMA_MARGIN = 0.0
 # Usar junto con LOOKAHEAD_FIX=True: autopiloto a las 15:30 → señales D-1,
 # entradas limit y salidas MOC → operativa coherente con el backtest.
 EXIT_MOC = True
+
+# Cuando True, --run exits evalúa condiciones y loguea decisiones pero NO envía
+# órdenes a Alpaca. Útil para validar la lógica sin operar.
+DRY_RUN = False
 
 # Cuando True, al materializarse una entrada se envía inmediatamente a Alpaca
 # una stop-limit GTC de venta al nivel stop_loss_price. Alpaca la ejecuta de

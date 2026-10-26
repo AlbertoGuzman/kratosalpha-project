@@ -881,7 +881,7 @@ def _scan_entry_signals(
             "crsi":        float(crsi),
             "rsi3":        float(row["RSI3"]) if not pd.isna(row["RSI3"]) else None,
             "streak":      int(row["STREAK"]) if not pd.isna(row["STREAK"]) else 0,
-            "limit_price": close * (1.0 - config.CONNORS_ENTRY_LIMIT),
+            "limit_price": None if getattr(config, "ENTRY_AT_OPEN", False) else close * (1.0 - config.CONNORS_ENTRY_LIMIT),
             "sma200":      float(sma200),
         })
     signals.sort(key=lambda s: s["crsi"])
@@ -1023,7 +1023,10 @@ def _abrir_posicion(sig: dict, cash: float, slot_size: float) -> tuple[float, bo
     se recorta proporcionalmente (con margen para la comisión). Si cae por
     debajo del 95 % del slot, no abre y devuelve `(cash, False)`.
     """
-    entry_p   = sig["limit_price"]
+    # Con ENTRY_AT_OPEN usamos el cierre anterior como referencia de precio
+    # (el fill real lo reporta Alpaca al reconciliar la orden a mercado).
+    entry_at_open = getattr(config, "ENTRY_AT_OPEN", False)
+    entry_p   = sig["close"] if entry_at_open else sig["limit_price"]
     cost_full = slot_size * (1 + config.COMMISSION)
     if cash >= cost_full:
         effective_slot = slot_size
@@ -1064,7 +1067,8 @@ def _abrir_posicion(sig: dict, cash: float, slot_size: float) -> tuple[float, bo
             broker = get_broker()
             resp = broker.submit_order(
                 ticker=sig["ticker"], qty=shares, side="buy",
-                order_type="limit", limit_price=entry_p,
+                order_type="market" if entry_at_open else "limit",
+                limit_price=None if entry_at_open else entry_p,
             )
             _insert_pending_order(
                 sig["ticker"], resp["order_id"], entry_p, effective_slot,
@@ -1802,9 +1806,13 @@ def run_connors_backtest(
     n_no_fill_sim   = 0   # señales descartadas por FILL_SIM (Low[D] > limit_price)
     rejected = {"sma": 0, "crsi": 0, "low3": 0}
 
+    real_fill_sim     = getattr(config, "REAL_FILL_SIM", False)
+    # REAL_FILL_SIM anula ENTRY_AT_OPEN e impone FILL_SIM + FILL_STRICT_SLOTS.
+    use_entry_at_open = getattr(config, "ENTRY_AT_OPEN", False) and not real_fill_sim
     use_fill_sim = (
-        getattr(config, "FILL_SIM", False)
+        (getattr(config, "FILL_SIM", False) or real_fill_sim)
         and not getattr(config, "FILL_AT_CLOSE", False)
+        and not use_entry_at_open
     )
 
     # Estructuras de debug (solo se rellenan si collect_debug=True)
@@ -1953,13 +1961,23 @@ def run_connors_backtest(
         n_signals_total += len(candidates)
         candidates.sort(key=lambda c: c["crsi"])
 
+        if real_fill_sim:
+            slots_disponibles = n_target - len(positions)
+            candidates = candidates[:slots_disponibles]
+
         for c in candidates:
             if len(positions) >= n_target:
                 break
             limit_p = c["close"] * (1.0 - config.CONNORS_ENTRY_LIMIT)
 
             # ── Precio y validez de fill ────────────────────────────────────
-            if use_fill_sim:
+            if use_entry_at_open:
+                # Market-at-open: 100 % fill, entrada al precio de apertura.
+                ind_d = indicators.get(c["ticker"])
+                if ind_d is None or d not in ind_d.index:
+                    continue
+                entry_p = float(ind_d.loc[d, "Open"])
+            elif use_fill_sim:
                 # Usa Open y Low del día de entrada D (ya descargados por yfinance)
                 ind_d = indicators.get(c["ticker"])
                 if ind_d is None or d not in ind_d.index:
