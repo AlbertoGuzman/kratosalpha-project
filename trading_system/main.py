@@ -365,7 +365,8 @@ def _mostrar_panel_alpaca(broker, acc, positions, orders) -> None:
             capital_inicial = float(config.CAPITAL_JUEGO)
         modo         = "Alpaca PAPER" if config.ALPACA_PAPER else "Alpaca REAL"
         n_abiertas   = len(positions) if positions else 0
-        n_pendientes = len(orders) if orders else 0
+        # Solo órdenes de compra pendientes (excluye stop_limit SELL de ALPACA_NATIVE_SL)
+        n_pendientes = sum(1 for o in (orders or []) if o.get("side") == "buy")
     else:
         cash   = connors["cash_libre"]     if connors else 0.0
         equity = connors["capital_actual"] if connors else 0.0
@@ -566,10 +567,9 @@ def _autopiloto_cerrar_connors_automatico(
     CRSI_EXIT. Devuelve el número de cierres ejecutados.
 
     Params:
-        usar_precio_alpaca: cuando True (modo --run exits a las 15:30 ET),
-            obtiene el precio en tiempo real de Alpaca para cada posición y lo
-            usa para calcular CRSI[D], replicando el comportamiento del backtest
-            (CRSI[D] > 60 → MOC → Close[D]) sin depender de yfinance intradía.
+        usar_precio_alpaca: cuando True, obtiene el precio en tiempo real de
+            Alpaca para calcular CRSI[D] con datos del día en curso. Los cierres
+            siempre se envían como órdenes de mercado inmediatas (nunca MOC).
     """
     positions = cr._get_open_positions()
     if not positions:
@@ -593,7 +593,7 @@ def _autopiloto_cerrar_connors_automatico(
             from modules.alpaca_broker import get_broker
             alpaca_pos = get_broker().get_positions()
             precios_alpaca = {
-                p["symbol"]: float(p["current_price"])
+                p["ticker"]: float(p["current_price"])
                 for p in alpaca_pos
                 if p.get("current_price")
             }
@@ -968,7 +968,7 @@ def _run_exits_real_time() -> int:
     _tlog = get_trading_logger()
 
     if not getattr(config, "ALPACA_ENABLED", False):
-        _slog.info("--run exits: Alpaca deshabilitado — nada que hacer")
+        _tlog.info("── run exits omitido: Alpaca deshabilitado ─────────────────────")
         return 0
 
     # ── 1. Verificar que el mercado esté abierto ─────────────────────────────
@@ -977,37 +977,56 @@ def _run_exits_real_time() -> int:
         broker = get_broker()
     except Exception as exc:
         _slog.error("--run exits: no se pudo conectar con Alpaca: %s", exc)
+        _tlog.info("── run exits omitido: error al conectar con Alpaca ─────────────")
         console.print(f"[red]✗ --run exits: error Alpaca: {exc}[/red]")
         return 0
 
     if not broker.is_market_open():
-        _slog.info("--run exits: mercado cerrado — ejecución omitida")
+        _tlog.info("── run exits omitido: mercado cerrado ──────────────────────────")
         console.print("[yellow]Mercado cerrado — --run exits no opera[/yellow]")
         return 0
 
-    # ── 2. Posiciones abiertas en SQLite ─────────────────────────────────────
+    _tlog.info("── INICIO run exits ────────────────────────────────────────────")
+
+    # ── 2. Reconciliar pendientes antes de leer posiciones abiertas ──────────
+    # Si las órdenes de compra del día aún no se han confirmado (estado='pendiente'
+    # en SQLite), _get_open_positions() las ignoraría. La reconciliación las
+    # pasa a 'abierta' si Alpaca las reporta como filled.
+    try:
+        cr._check_pending_orders()
+    except Exception as exc:
+        _slog.warning("--run exits: reconciliación pendientes falló: %s", exc)
+
+    # ── 3. Posiciones abiertas en SQLite ─────────────────────────────────────
     positions = cr._get_open_positions()
     if not positions:
-        _tlog.info("--run exits: 0 posiciones abiertas")
+        _tlog.info("[EXITS] Sin posiciones abiertas — nada que revisar")
+        _tlog.info("── FIN run exits ───────────────────────────────────────────────")
         return 0
 
     # ── 3. Precios vivos y órdenes abiertas (una sola llamada por tipo) ──────
     try:
         alpaca_pos = broker.get_positions()
         precios_alpaca = {
-            p["symbol"]: float(p["current_price"])
+            p["ticker"]: float(p["current_price"])
             for p in alpaca_pos
             if p.get("current_price")
         }
     except Exception as exc:
         _slog.error("--run exits: error obteniendo precios Alpaca: %s", exc)
+        _tlog.info("[EXITS] Error al obtener precios Alpaca: %s — abortando", exc)
+        _tlog.info("── FIN run exits ───────────────────────────────────────────────")
         console.print(f"[red]✗ --run exits: error precios: {exc}[/red]")
         return 0
 
     try:
         open_orders = broker.get_orders(status="open")
+        # Excluir stop_limit GTC (órdenes nativas de SL gestionadas por Alpaca):
+        # si decidimos vender, la orden de mercado cierra la posición y Alpaca
+        # cancela automáticamente la stop_limit huérfana.
         tickers_con_sell = {
-            o["ticker"] for o in open_orders if o.get("side") == "sell"
+            o["ticker"] for o in open_orders
+            if o.get("side") == "sell" and o.get("type") != "stop_limit"
         }
     except Exception as exc:
         _slog.warning("--run exits: no se pudieron obtener órdenes abiertas: %s", exc)
@@ -1020,29 +1039,33 @@ def _run_exits_real_time() -> int:
 
     # ── 5. Evaluar señales de salida ─────────────────────────────────────────
     exits = cr._scan_exit_signals(positions, precios_alpaca=precios_alpaca)
-    exit_map = {e["ticker"]: e for e in exits if e.get("reason")}
+    # Indexar por ticker para acceso rápido (incluye los que no tienen reason)
+    exit_map = {e["ticker"]: e for e in exits}
 
-    dry_run   = getattr(config, "DRY_RUN", False)
+    dry_run    = getattr(config, "DRY_RUN", False)
     n_vendidas = n_mantenidas = n_errores = 0
 
     for ticker, pos in positions.items():
         precio = precios_alpaca.get(ticker, 0.0)
         exit_e = exit_map.get(ticker)
         reason = exit_e["reason"] if exit_e else None
+        dias   = exit_e["dias"]   if exit_e else 0
 
         try:
             if not reason:
-                _slog.info(
-                    "exits ticker=%-6s precio=%.2f decision=MANTENER", ticker, precio
+                _tlog.info(
+                    "[EXITS] %-6s @ %.2f$ · %dd · sin señal → MANTENER",
+                    ticker, precio, dias,
                 )
                 console.print(f"  {ticker} @ ${precio:.2f} → MANTENER")
                 n_mantenidas += 1
                 continue
 
-            # ── Verificar orden sell duplicada ────────────────────────────
+            # ── Verificar orden sell duplicada (excluye stop_limit nativas) ──
             if ticker in tickers_con_sell:
-                _slog.warning(
-                    "exits ticker=%-6s orden sell ya activa — omitiendo", ticker
+                _tlog.warning(
+                    "[EXITS] %-6s @ %.2f$ · %dd · %s → MANTENER (sell ya activa en Alpaca)",
+                    ticker, precio, dias, reason,
                 )
                 console.print(
                     f"  [yellow]{ticker}[/yellow] → orden sell ya activa, omitiendo"
@@ -1050,19 +1073,22 @@ def _run_exits_real_time() -> int:
                 n_mantenidas += 1
                 continue
 
-            _slog.info(
-                "exits ticker=%-6s precio=%.2f reason=%-10s decision=VENDER",
-                ticker, precio, reason,
+            if dry_run:
+                _tlog.info(
+                    "[EXITS] %-6s @ %.2f$ · %dd · %s → [DRY_RUN] orden omitida",
+                    ticker, precio, dias, reason,
+                )
+                console.print(f"  [dim][DRY_RUN] {ticker} @ ${precio:.2f} → {reason} (orden omitida)[/dim]")
+                n_vendidas += 1
+                continue
+
+            _tlog.info(
+                "[EXITS] %-6s @ %.2f$ · %dd · %s → VENDER",
+                ticker, precio, dias, reason,
             )
             console.print(
                 f"  [cyan]{ticker}[/cyan] @ ${precio:.2f} → VENDER ({reason})"
             )
-
-            if dry_run:
-                _slog.info("exits DRY_RUN activo — orden omitida para %s", ticker)
-                console.print(f"  [dim][DRY_RUN] Orden omitida para {ticker}[/dim]")
-                n_vendidas += 1
-                continue
 
             # allow_moc=False → siempre market+day (sin MOC, en paper y real)
             cr._close_position_db(
@@ -1073,16 +1099,18 @@ def _run_exits_real_time() -> int:
 
         except Exception as exc:
             _slog.error("exits error en %s: %s", ticker, exc, exc_info=True)
+            _tlog.error("[EXITS] %-6s — error inesperado: %s", ticker, exc)
             console.print(f"  [red]✗ Error en {ticker}: {exc}[/red]")
             n_errores += 1
 
     # ── 6. Resumen ────────────────────────────────────────────────────────────
     n_revisadas = len(positions)
     resumen = (
-        f"--run exits: {n_revisadas} revisadas · "
+        f"run exits: {n_revisadas} revisadas · "
         f"{n_vendidas} vendidas · {n_mantenidas} mantenidas · {n_errores} errores"
     )
     _tlog.info(resumen)
+    _tlog.info("── FIN run exits ───────────────────────────────────────────────")
     console.print(f"[bold]{resumen}[/bold]")
     return n_vendidas
 

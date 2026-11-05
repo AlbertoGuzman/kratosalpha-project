@@ -218,49 +218,17 @@ def _get_pending_sells() -> set:
         broker = get_broker()
         open_orders = broker.get_orders(status="open")
         portfolio   = set(_get_open_positions().keys())
+        # Excluir stop_limit GTC (órdenes nativas de SL): no son "ventas en
+        # vuelo" decididas por el sistema — liberarían el slot prematuramente.
         return {o["ticker"] for o in open_orders
-                if o.get("side") == "sell" and o["ticker"] in portfolio}
+                if o.get("side") == "sell"
+                and o.get("type") != "stop_limit"
+                and o["ticker"] in portfolio}
     except Exception as exc:
         _slog.warning("_get_pending_sells: no se pudo consultar Alpaca: %s", exc)
         return set()
 
 
-def _cierres_alpaca_pendientes(positions: dict, pendings: dict) -> int:
-    """
-    Número de posiciones que ya están 'cerrada' en SQLite pero siguen abiertas
-    en Alpaca porque su orden de cierre (MOC u otro) aún no se ha ejecutado.
-
-    Compara los tickers activos en SQLite (abierta+pendiente) con los que
-    Alpaca reporta como posiciones abiertas. La diferencia son cierres en
-    tránsito que ocupan un slot real en el broker aunque SQLite ya los contabilice
-    como libres.
-
-    Si Alpaca no está habilitado o no responde, devuelve 0 (comportamiento
-    anterior, sin penalización extra).
-
-    Params:
-        positions: dict devuelto por _get_open_positions() (estado='abierta').
-        pendings:  dict devuelto por _get_pending_orders()  (estado='pendiente').
-    Returns:
-        Número de slots bloqueados por cierres Alpaca pendientes.
-    """
-    if not getattr(config, "ALPACA_ENABLED", False):
-        return 0
-    try:
-        from modules.alpaca_broker import get_broker
-        broker = get_broker()
-        alpaca_tickers = {p["ticker"] for p in broker.get_positions()}
-        active_tickers = set(positions) | set(pendings)
-        ghost = alpaca_tickers - active_tickers
-        if ghost:
-            _slog.info(
-                "Cierres Alpaca pendientes (bloquean slot): %s",
-                sorted(ghost),
-            )
-        return len(ghost)
-    except Exception as exc:
-        _slog.warning("_cierres_alpaca_pendientes: no se pudo consultar Alpaca: %s", exc)
-        return 0
 
 
 def _count_pending_orders() -> int:
@@ -881,7 +849,7 @@ def _scan_entry_signals(
             "crsi":        float(crsi),
             "rsi3":        float(row["RSI3"]) if not pd.isna(row["RSI3"]) else None,
             "streak":      int(row["STREAK"]) if not pd.isna(row["STREAK"]) else 0,
-            "limit_price": None if getattr(config, "ENTRY_AT_OPEN", False) else close * (1.0 - config.CONNORS_ENTRY_LIMIT),
+            "limit_price": close if getattr(config, "ENTRY_AT_OPEN", False) else close * (1.0 - config.CONNORS_ENTRY_LIMIT),
             "sma200":      float(sma200),
         })
     signals.sort(key=lambda s: s["crsi"])
@@ -1221,17 +1189,15 @@ def aperturas_automaticas(
     n_open        = len(positions)
     n_pending     = len(pendings)
     n_selling     = len(pending_sells)
-    n_ghost       = _cierres_alpaca_pendientes(positions, pendings)
     cash          = _get_current_cash()
 
     slot_size    = _get_slot_size(cash, positions)
-    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling - n_ghost
+    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling
     if slots_libres <= 0:
         console.print(
             f"[yellow]No hay slots disponibles "
             f"({n_open} abiertas + {n_pending} pendientes"
-            + (f" + {n_ghost} cierre(s) Alpaca pendiente(s)" if n_ghost else "")
-            + f" / {config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
+            f" / {config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
         )
         return 0
     if cash < slot_size * 0.95:
@@ -1307,19 +1273,16 @@ def opcion_registrar_entrada() -> None:
     n_open        = len(positions)
     n_pending     = len(pendings)
     n_selling     = len(pending_sells)
-    n_ghost       = _cierres_alpaca_pendientes(positions, pendings)
     cash          = _get_current_cash()
 
     slot_size = _get_slot_size(cash, positions)
 
-    # ── Slots libres (descuenta abiertas, pendientes y cierres Alpaca en tránsito) ─
-    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling - n_ghost
+    slots_libres = config.CONNORS_MAX_POS - n_open - n_pending + n_selling
     if slots_libres <= 0:
         console.print(
             f"[yellow]No hay slots disponibles "
             f"({n_open} abiertas + {n_pending} pendientes"
-            + (f" + {n_ghost} cierre(s) Alpaca pendiente(s)" if n_ghost else "")
-            + f" / {config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
+            f" / {config.CONNORS_MAX_POS}). Cierra o espera ejecución.[/yellow]"
         )
         return
     if cash < slot_size * 0.95:
@@ -1539,15 +1502,9 @@ def opcion_registrar_salida() -> None:
 
 def _close_position_db(
     ticker: str, pos: dict, exit_price: float, reason: str, exit_d: date,
-    allow_moc: bool = False,
+    allow_moc: bool = False,  # obsoleto, ignorado — siempre market order
 ) -> None:
-    """Cierra una posición: UPDATE de la operación a estado 'cerrada'.
-
-    Params:
-        allow_moc: cuando True (y EXIT_MOC=True en config), envía la orden de
-            venta como MOC. Solo debe activarse desde --run exits, donde el
-            precio Alpaca es en tiempo real y se está dentro del deadline 15:50 ET.
-    """
+    """Cierra una posición: UPDATE de la operación a estado 'cerrada'."""
     shares           = pos["shares"]
     entry_p          = pos["entry_price"]
     val_compra       = pos["valor_compra"]
@@ -1644,39 +1601,8 @@ def _close_position_db(
             if sl_already_filled:
                 pass  # la posición ya cerró vía stop nativa; nada más que hacer
             else:
-                # SL siempre market inmediato; CRSI_EXIT/TSTO/MANUAL pueden ser MOC
-                # solo si el llamador lo permite (--run exits con precio real) y
-                # estamos en cuenta real (paper no procesa MOC → posiciones fantasma).
-                is_paper = getattr(config, "ALPACA_PAPER", True)
-                use_moc = (
-                    allow_moc
-                    and getattr(config, "EXIT_MOC", False)
-                    and reason != "SL"
-                    and not is_paper
-                )
-                if use_moc:
-                    # MOC: fill al cierre NYSE, igual que el backtest (Close[D]).
-                    # Alpaca no admite fracciones en MOC → enviar entero como MOC
-                    # y el resto fraccionario como market para cerrar todo.
-                    # Deadline Alpaca: 15:50 ET.
-                    moc_qty = int(shares)
-                    frac_qty = round(shares - moc_qty, 6)
-                    if moc_qty > 0:
-                        broker.submit_order(ticker, moc_qty, "sell", moc=True)
-                    if frac_qty > 0.0001:
-                        broker.submit_order(ticker, frac_qty, "sell", "market")
-                    if moc_qty <= 0:
-                        # Posición <1 acción, solo market
-                        broker.close_position(ticker)
-                    console.print(
-                        f"[cyan]📤 Orden MOC enviada para {ticker} "
-                        f"({moc_qty} acc. MOC"
-                        + (f" + {frac_qty:.4f} market" if frac_qty > 0.0001 else "")
-                        + f")[/cyan]"
-                    )
-                else:
-                    broker.close_position(ticker)
-                    console.print(f"[cyan]📤 Posición cerrada en Alpaca: {ticker}[/cyan]")
+                broker.close_position(ticker)
+                console.print(f"[cyan]📤 Posición cerrada en Alpaca: {ticker}[/cyan]")
         except Exception as exc:
             console.print(f"[yellow]⚠ Alpaca: {exc}[/yellow]")
             _slog.error("close_position Alpaca %s: %s", ticker, exc, exc_info=True)

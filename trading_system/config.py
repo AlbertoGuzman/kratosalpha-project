@@ -57,7 +57,7 @@ CONNORS_ENTRY_CRSI    = 25       # umbral de entrada (CRSI < 25)
 CONNORS_EXIT_CRSI     = 60       # umbral de salida (CRSI > 60)
 CONNORS_STOP_LOSS     = 0.5   # 5 %
 CONNORS_TIME_STOP     = 4        # días máximos abierta
-CONNORS_ENTRY_LIMIT   = -0.015   # descuento sobre Close[D-1] para la orden limit
+CONNORS_ENTRY_LIMIT   = -0.015   # descuento (>0) o prima (<0) sobre Close[D-1] para la orden limit
 
 # Cuando True, ignora CONNORS_ENTRY_LIMIT y compra todos los candidatos al
 # precio de apertura del día de entrada (Open[D]). Fill rate 100 %, sin orden
@@ -107,12 +107,10 @@ REAL_FILL_SIM = True
 # El análisis OOS 2020-2026 mostró WR=55 % cuando SPY está en la franja 0-1 %.
 SPY_SMA_MARGIN = 0.0
 
-# Cuando True, los cierres de posición en Alpaca se envían como órdenes MOC
-# (Market on Close, TimeInForce.CLS) en lugar de órdenes de mercado inmediatas.
-# El fill ocurre al cierre de NYSE ese día, igual que en el backtest (Close[D]).
-# Usar junto con LOOKAHEAD_FIX=True: autopiloto a las 15:30 → señales D-1,
-# entradas limit y salidas MOC → operativa coherente con el backtest.
-EXIT_MOC = True
+# Desactivado: los cierres siempre usan orden de mercado inmediata.
+# -- run all  → market order al abrir NYSE (o en el momento de ejecución)
+# -- run exits → market order al precio en tiempo real de Alpaca
+EXIT_MOC = False
 
 # Cuando True, --run exits evalúa condiciones y loguea decisiones pero NO envía
 # órdenes a Alpaca. Útil para validar la lógica sin operar.

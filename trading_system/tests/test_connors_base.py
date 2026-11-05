@@ -154,9 +154,8 @@ class TestConnorsEntrada:
             row = con.execute(
                 "SELECT entry_price, limit_price FROM connors_operaciones"
             ).fetchone()
-        # limit_price <= entry_price (la entrada es al límite inferior).
-        assert row[1] <= row[0]
-        # Y la diferencia es ≈ ENTRY_LIMIT.
+        # La relación siempre es limit_price = entry_price × (1 - ENTRY_LIMIT),
+        # independientemente del signo (negativo = prima sobre el cierre).
         ratio = row[1] / row[0]
         assert ratio == pytest.approx(1 - config.CONNORS_ENTRY_LIMIT, abs=1e-6)
 
