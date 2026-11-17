@@ -1033,6 +1033,28 @@ def _abrir_posicion(sig: dict, cash: float, slot_size: float) -> tuple[float, bo
         try:
             from modules.alpaca_broker import get_broker
             broker = get_broker()
+            # Alpaca rechaza (403 wash trade) una compra si hay una venta viva
+            # del mismo ticker (p. ej. cierre MOC/TSTO recién enviado). Se
+            # comprueba antes y se salta la apertura sin enviar la orden.
+            try:
+                venta_viva = [
+                    o for o in broker.get_orders("open")
+                    if o["ticker"] == sig["ticker"] and o["side"] == "sell"
+                ]
+            except Exception as exc_chk:
+                venta_viva = []
+                _slog.warning("no se pudo comprobar órdenes abiertas de %s: %s",
+                              sig["ticker"], exc_chk)
+            if venta_viva:
+                console.print(
+                    f"  [yellow]⚠ {sig['ticker']}: hay una venta pendiente en Alpaca "
+                    f"— apertura omitida (evita wash trade)[/yellow]"
+                )
+                _slog.warning("apertura omitida %s: venta viva en Alpaca (%s)",
+                              sig["ticker"], venta_viva[0]["id"])
+                _tlog.warning("[CONNORS] OMITIDA   %-6s · venta pendiente en Alpaca (wash trade)",
+                              sig["ticker"])
+                return cash, False
             resp = broker.submit_order(
                 ticker=sig["ticker"], qty=shares, side="buy",
                 order_type="market" if entry_at_open else "limit",
@@ -1057,6 +1079,8 @@ def _abrir_posicion(sig: dict, cash: float, slot_size: float) -> tuple[float, bo
                 f"  [red]✗ {sig['ticker']}: Alpaca rechazó la orden — {exc}[/red]"
             )
             _slog.error("apertura Alpaca rechazada %s: %s", sig["ticker"], exc, exc_info=True)
+            _tlog.warning("[CONNORS] RECHAZADA %-6s · Alpaca rechazó la apertura: %s",
+                          sig["ticker"], exc)
             return cash, False
 
     # ── Flujo sin Alpaca (SQLite es la fuente de verdad) ─────────────────────
