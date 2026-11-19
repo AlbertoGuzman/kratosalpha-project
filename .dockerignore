@@ -1,0 +1,17 @@
+.venv/
+**/.venv/
+trading_env/
+.env
+**/.env
+.git/
+.gitignore
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+
+# Estado en tiempo de ejecución: vive en GCS, no en la imagen
+**/data/
+**/logs/
+**/backups/
+**/exports/
+public_logs/

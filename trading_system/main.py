@@ -1333,6 +1333,16 @@ def main() -> None:
 
 if __name__ == "__main__":
     if _RUN_MODE is not None:
-        sys.exit(_run_headless(_RUN_MODE))
+        # Modo desatendido: cualquier excepción no controlada → exit code 1
+        # (Cloud Run / cron necesitan un código fiable); ejecución limpia → 0.
+        try:
+            _rc = _run_headless(_RUN_MODE)
+        except Exception as _exc:
+            get_system_logger().error(
+                "Excepción no controlada en --run %s: %s", _RUN_MODE, _exc, exc_info=True
+            )
+            console.print(f"[red]✗ Excepción no controlada: {_exc}[/red]")
+            sys.exit(1)
+        sys.exit(0 if _rc == 0 else 1)
     else:
         main()
